@@ -87,13 +87,13 @@ pub fn triangulate(outer: &[(f64, f64)], holes: &[Vec<(f64, f64)>]) -> Option<Ve
             let v = pts[vi];
             let d = (v.0 - pm.0).powi(2) + (v.1 - pm.1).powi(2);
             if best.is_none_or(|b| d < b.1) {
-                if !edges_clear(v, &mut work) {
-                    continue;
-                }
+                let clear = edges_clear(v, &mut work);
                 if work > MAX_WORK {
                     return None;
                 }
-                best = Some((k, d));
+                if clear {
+                    best = Some((k, d));
+                }
             }
         }
         let (k, _) = best?;

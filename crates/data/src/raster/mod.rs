@@ -14,7 +14,7 @@ pub mod geotiff;
 pub mod wkt;
 pub mod zarr;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use crs::{Crs, Transformer};
 use rustgis_geom::{Coord, Extent};
@@ -355,6 +355,110 @@ impl Raster {
             (x, y)
         }
     }
+
+    /// Applies GDAL PAM (Persistent Auxiliary Metadata) from an `.aux.xml` document.
+    ///
+    /// Updates band names from `<Description>`, sets `nodata` from `<NoDataValue>` if absent,
+    /// applies precomputed statistics from `<MDI key="STATISTICS_...">`, histograms from `<HistCounts>`,
+    /// palette from `<ColorTable>`, and coordinate reference system from `<SRS>`.
+    pub fn apply_pam_xml(&mut self, xml: &str) {
+        let doc = match crate::xml::parse(xml, roxmltree::ParsingOptions::default()) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let mut nodata_changed = false;
+        if self.nodata.is_none() {
+            let nd = doc
+                .descendants()
+                .find(|n| n.has_tag_name("NoDataValue"))
+                .and_then(|n| n.text())
+                .and_then(|t| t.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite());
+            if let Some(val) = nd {
+                self.nodata = Some(val);
+                nodata_changed = true;
+            }
+        }
+
+        if nodata_changed {
+            let nd = self.nodata.filter(|v| v.is_finite()).map(|v| v as f32);
+            let valid = move |v: f32| v.is_finite() && nd.is_none_or(|d| v != d);
+            for band in &mut self.bands {
+                band.stats = BandStats::compute(&band.data, valid);
+            }
+        }
+
+        for (default_idx, band_node) in doc.descendants().filter(|n| n.has_tag_name("PAMRasterBand")).enumerate() {
+            let target_idx =
+                band_node.attribute("band").and_then(|s| s.parse::<usize>().ok()).and_then(|i| i.checked_sub(1)).unwrap_or(default_idx);
+
+            let Some(band) = self.bands.get_mut(target_idx) else {
+                continue;
+            };
+
+            if let Some(desc) = band_node.children().find(|n| n.has_tag_name("Description")).and_then(|n| n.text()) {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    band.name = trimmed.to_string();
+                }
+            }
+
+            for mdi in band_node.descendants().filter(|n| n.has_tag_name("MDI")) {
+                let key = mdi.attribute("key").unwrap_or("");
+                let val = mdi.text().and_then(|t| t.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
+                match (key, val) {
+                    ("STATISTICS_MINIMUM", Some(v)) => band.stats.min = v,
+                    ("STATISTICS_MAXIMUM", Some(v)) => band.stats.max = v,
+                    ("STATISTICS_MEAN", Some(v)) => band.stats.mean = v,
+                    ("STATISTICS_STDDEV", Some(v)) => band.stats.std_dev = v,
+                    _ => {}
+                }
+            }
+
+            let counts_str = band_node
+                .descendants()
+                .find(|n| n.has_tag_name("HistItem"))
+                .and_then(|n| n.children().find(|c| c.has_tag_name("HistCounts")))
+                .and_then(|n| n.text());
+            if let Some(counts_str) = counts_str {
+                let counts: Vec<u64> = counts_str
+                    .split(['|', ' ', '\t', '\n', '\r'])
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .collect();
+                if counts.len() == HISTOGRAM_BINS {
+                    band.stats.histogram = counts;
+                }
+            }
+
+            if let Some(color_table) = band_node.children().find(|n| n.has_tag_name("ColorTable")) {
+                let mut palette = Vec::new();
+                for entry in color_table.children().filter(|n| n.has_tag_name("ColorEntry")) {
+                    let c1 = entry.attribute("c1").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+                    let c2 = entry.attribute("c2").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+                    let c3 = entry.attribute("c3").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+                    let c4 = entry.attribute("c4").and_then(|v| v.parse::<u8>().ok()).unwrap_or(255);
+                    palette.push([c1, c2, c3, c4]);
+                }
+                if !palette.is_empty() {
+                    self.color = ColorHint::Palette(palette);
+                }
+            }
+        }
+
+        if self.crs == Crs::LonLat {
+            let wkt_text = doc.descendants().find(|n| n.has_tag_name("SRS")).and_then(|n| n.text());
+            if let Some(wkt_text) = wkt_text
+                && let Ok(new_crs) = wkt::crs_from_wkt(wkt_text.trim())
+                && let Ok(transformer) = new_crs.transformer().map_err(DataError::Format)
+            {
+                self.crs = new_crs;
+                self.transformer = transformer;
+                self.extent = self.compute_extent();
+            }
+        }
+    }
 }
 
 /// Reads a raster file by path.
@@ -394,6 +498,9 @@ pub fn read_path(path: &Path) -> Result<Raster> {
         }
         other => return Err(DataError::Unsupported(format!(".{other}"))),
     };
+    if let Some(aux) = read_aux_xml(path) {
+        r.apply_pam_xml(&aux);
+    }
     r.source = Some(path.display().to_string());
     Ok(r)
 }
@@ -422,6 +529,9 @@ pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     let mut r = geotiff::read_file(&c.path, stem)?;
     if let Some(s) = &c.subdataset {
         r.name = format!("{stem} {}", gdal::short_name(s));
+    }
+    if let Some(aux) = read_aux_xml(path) {
+        r.apply_pam_xml(&aux);
     }
     r.source = Some(path.display().to_string());
     Ok(r)
@@ -546,6 +656,29 @@ pub fn read_prj(path: &Path) -> Option<String> {
     std::fs::read_to_string(prj).ok()
 }
 
+/// The text of a GDAL PAM (`.aux.xml`) sidecar file next to `path`, if one exists.
+/// Checks `<path>.aux.xml` first, then `<stem>.aux.xml`.
+pub fn read_aux_xml(path: &Path) -> Option<String> {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".aux.xml");
+    let p1 = PathBuf::from(s);
+    let p2 = path.with_extension("aux.xml");
+
+    let target = if p1.is_file() {
+        p1
+    } else if p2.is_file() && p2 != path {
+        p2
+    } else {
+        return None;
+    };
+
+    let meta = std::fs::metadata(&target).ok()?;
+    if !meta.is_file() || meta.len() > 10 << 20 {
+        return None;
+    }
+    std::fs::read_to_string(target).ok()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -614,6 +747,105 @@ pub(crate) mod tests {
         assert!(read_bytes("x.tif", b"not a tiff").is_err());
         assert!(read_bytes("x.asc", &[0xff, 0xfe]).is_err());
         assert!(read_bytes("x.png", b"").is_err());
+    }
+
+    #[test]
+    fn pam_aux_xml_metadata_and_stats() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+        // Raster with 2 bands, no initial nodata, default names "Band 1" and "Band 2"
+        let b1 = vec![1.0, 2.0, -9999.0, 4.0];
+        let b2 = vec![10.0, 20.0, 30.0, 40.0];
+        let mut r = Raster::new("test", 2, 2, vec![b1, b2], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        assert_eq!(r.nodata, None);
+        assert_eq!(r.bands[0].name, "Band 1");
+        assert_eq!(r.bands[1].name, "Band 2");
+        assert_eq!(r.bands[0].stats.min, -9999.0);
+
+        let mut hist_counts = vec!["0"; 256];
+        hist_counts[10] = "5";
+        hist_counts[200] = "15";
+        let hist_counts_str = hist_counts.join("|");
+
+        let xml = format!(
+            r#"<PAMDataset>
+  <SRS>PROJCS["WGS 84 / UTM zone 31N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",3],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1]]</SRS>
+  <PAMRasterBand band="1">
+    <Description>Near Infrared</Description>
+    <NoDataValue>-9999</NoDataValue>
+    <Metadata>
+      <MDI key="STATISTICS_MINIMUM">1.0</MDI>
+      <MDI key="STATISTICS_MAXIMUM">4.0</MDI>
+      <MDI key="STATISTICS_MEAN">2.333</MDI>
+      <MDI key="STATISTICS_STDDEV">1.247</MDI>
+    </Metadata>
+    <Histograms>
+      <HistItem>
+        <HistCounts>{hist_counts_str}</HistCounts>
+      </HistItem>
+    </Histograms>
+  </PAMRasterBand>
+  <PAMRasterBand band="2">
+    <Description>Thermal</Description>
+    <ColorTable>
+      <ColorEntry c1="255" c2="0" c3="0" c4="255"/>
+      <ColorEntry c1="0" c2="255" c3="0" c4="255"/>
+    </ColorTable>
+  </PAMRasterBand>
+</PAMDataset>"#
+        );
+
+        r.apply_pam_xml(&xml);
+
+        // Band names updated
+        assert_eq!(r.bands[0].name, "Near Infrared");
+        assert_eq!(r.bands[1].name, "Thermal");
+
+        // NoDataValue updated
+        assert_eq!(r.nodata, Some(-9999.0));
+
+        // Band 1 statistics and histogram updated
+        assert_eq!(r.bands[0].stats.min, 1.0);
+        assert_eq!(r.bands[0].stats.max, 4.0);
+        assert_eq!(r.bands[0].stats.mean, 2.333);
+        assert_eq!(r.bands[0].stats.std_dev, 1.247);
+        assert_eq!(r.bands[0].stats.histogram[10], 5);
+        assert_eq!(r.bands[0].stats.histogram[200], 15);
+
+        // Band 2 ColorTable palette updated
+        assert_eq!(r.color, ColorHint::Palette(vec![[255, 0, 0, 255], [0, 255, 0, 255]]));
+
+        // SRS updated
+        assert_eq!(r.crs, Crs::Epsg(32631));
+    }
+
+    #[test]
+    fn read_aux_xml_file_sidecars() {
+        let dir = std::env::temp_dir().join(format!("rustgis_pam_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let grid_path = dir.join("elevation.asc");
+        let aux_path = dir.join("elevation.asc.aux.xml");
+        let asc_content = "ncols 2\nnrows 2\nxllcorner 0.0\nyllcorner 0.0\ncellsize 1.0\n10 20\n30 -9999\n";
+        let aux_content = r#"<PAMDataset>
+  <PAMRasterBand band="1">
+    <Description>Elevation Band</Description>
+    <NoDataValue>-9999</NoDataValue>
+  </PAMRasterBand>
+</PAMDataset>"#;
+
+        std::fs::write(&grid_path, asc_content).unwrap();
+        std::fs::write(&aux_path, aux_content).unwrap();
+
+        assert_eq!(read_aux_xml(&grid_path), Some(aux_content.to_string()));
+
+        let raster = read_path(&grid_path).unwrap();
+        assert_eq!(raster.bands[0].name, "Elevation Band");
+        assert_eq!(raster.nodata, Some(-9999.0));
+        assert_eq!(raster.bands[0].stats.min, 10.0);
+        assert_eq!(raster.bands[0].stats.max, 30.0);
+        assert_eq!(raster.bands[0].stats.count, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

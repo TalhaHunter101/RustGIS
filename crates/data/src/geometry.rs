@@ -413,6 +413,9 @@ pub fn seg_dist2(line: &[Coord], p: Coord) -> f64 {
 
 /// Whether a line segment intersects an extent (including crossing through it or touching boundaries).
 pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
+    if !p1.is_finite() || !p2.is_finite() || e.is_empty() {
+        return false;
+    }
     if e.contains(p1) || e.contains(p2) {
         return true;
     }
@@ -498,13 +501,17 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 
 /// Planar centroid of a ring (vertex average when degenerate).
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
+    if !ring.iter().all(|c| c.is_finite()) {
+        return None;
+    }
     let a = ring_area(ring);
     if a.abs() < 1e-12 {
-        let n = ring.len() as f64;
+        let pts = if ring.len() > 1 && ring.first() == ring.last() { &ring[..ring.len() - 1] } else { ring };
+        let n = pts.len() as f64;
         if n == 0.0 {
             return None;
         }
-        let (sx, sy) = ring.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x, y + c.y));
+        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x, y + c.y));
         return Some(Coord::new(sx / n, sy / n));
     }
     let n = ring.len();
@@ -560,6 +567,24 @@ mod tests {
         assert!(segment_intersects_extent(Coord::new(-5.0, 10.0), Coord::new(15.0, 10.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         // Segment outside box
         assert!(!segment_intersects_extent(Coord::new(-5.0, 12.0), Coord::new(15.0, 12.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        // Non-finite segment coordinates or empty extents never intersect
+        assert!(!segment_intersects_extent(Coord::new(f64::NAN, -1.0), Coord::new(5.0, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(!segment_intersects_extent(Coord::new(5.0, 5.0), Coord::new(f64::NAN, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(!segment_intersects_extent(Coord::new(f64::INFINITY, 0.0), Coord::new(5.0, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
+    }
+
+    #[test]
+    fn degenerate_ring_centroid_is_rotation_independent_and_ignores_duplicate_closing_vertex() {
+        let closed_a = vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0), Coord::new(0.0, 0.0)];
+        let closed_b = vec![Coord::new(10.0, 0.0), Coord::new(0.0, 0.0), Coord::new(10.0, 0.0)];
+        assert_eq!(ring_centroid(&closed_a), Some(Coord::new(5.0, 0.0)));
+        assert_eq!(ring_centroid(&closed_b), Some(Coord::new(5.0, 0.0)));
+        let open = vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0)];
+        assert_eq!(ring_centroid(&open), Some(Coord::new(5.0, 0.0)));
+        let non_finite = vec![Coord::new(f64::NAN, 0.0), Coord::new(10.0, 0.0), Coord::new(f64::NAN, 0.0)];
+        assert_eq!(ring_centroid(&non_finite), None);
+        assert_eq!(ring_centroid(&[]), None);
     }
 
     #[test]

@@ -436,11 +436,19 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         return false;
     }
 
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    if !dx.is_finite() || !dy.is_finite() {
-        return false;
-    }
+    // Halve coordinates and bounds so differences and q terms cannot overflow f64::MAX.
+    // In Liang-Barsky, ratios q / p cancel the common 0.5 factor exactly.
+    let h_p1_x = p1.x * 0.5;
+    let h_p1_y = p1.y * 0.5;
+    let h_p2_x = p2.x * 0.5;
+    let h_p2_y = p2.y * 0.5;
+    let h_min_x = e.min_x * 0.5;
+    let h_max_x = e.max_x * 0.5;
+    let h_min_y = e.min_y * 0.5;
+    let h_max_y = e.max_y * 0.5;
+
+    let dx = h_p2_x - h_p1_x;
+    let dy = h_p2_y - h_p1_y;
     let mut t0 = 0.0f64;
     let mut t1 = 1.0f64;
 
@@ -467,7 +475,7 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         true
     };
 
-    clip(-dx, p1.x - e.min_x) && clip(dx, e.max_x - p1.x) && clip(-dy, p1.y - e.min_y) && clip(dy, e.max_y - p1.y) && t0 <= t1
+    clip(-dx, h_p1_x - h_min_x) && clip(dx, h_max_x - h_p1_x) && clip(-dy, h_p1_y - h_min_y) && clip(dy, h_max_y - h_p1_y) && t0 <= t1
 }
 
 /// Even-odd point-in-ring test.
@@ -513,7 +521,8 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 
 /// Planar centroid of a ring (vertex average when degenerate).
 ///
-/// Returns `None` if the ring contains non-finite coordinates or has no vertices.
+/// Returns `None` if the ring contains non-finite coordinates, has no vertices, or if floating-point
+/// cross products overflow `f64`.
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
@@ -591,7 +600,9 @@ mod tests {
         assert!(!segment_intersects_extent(Coord::new(f64::NAN, -1.0), Coord::new(5.0, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(-5.0, -5.0), Coord::new(f64::INFINITY, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(-5.0, 5.0), Coord::new(f64::INFINITY, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
-        assert!(!segment_intersects_extent(Coord::new(-1e308, 20.0), Coord::new(1e308, 20.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        // Huge coordinates exceeding normal span: non-crossing returns false, crossing returns true
+        assert!(!segment_intersects_extent(Coord::new(-1.7e308, 20.0), Coord::new(1.7e308, 20.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(segment_intersects_extent(Coord::new(-1.7e308, 5.0), Coord::new(1.7e308, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
 

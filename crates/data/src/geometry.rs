@@ -522,7 +522,7 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 /// Planar centroid of a ring (vertex average when degenerate).
 ///
 /// Returns `None` if the ring contains non-finite coordinates, has no vertices, or if floating-point
-/// cross products overflow `f64`.
+/// coordinate sums or cross products overflow `f64`.
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
@@ -537,7 +537,8 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
             return None;
         }
         let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x, y + c.y));
-        return Some(Coord::new(sx / n, sy / n));
+        let c = Coord::new(sx / n, sy / n);
+        return c.is_finite().then_some(c);
     }
     let n = ring.len();
     let (mut cx, mut cy) = (0.0, 0.0);
@@ -619,6 +620,8 @@ mod tests {
         assert_eq!(ring_centroid(&[]), None);
         let huge_ring = vec![Coord::new(1e160, 0.0), Coord::new(0.0, 1e160), Coord::new(-1e160, 0.0), Coord::new(1e160, 0.0)];
         assert_eq!(ring_centroid(&huge_ring), None);
+        let overflow = vec![Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0)];
+        assert_eq!(ring_centroid(&overflow), None);
     }
 
     #[test]
@@ -635,7 +638,7 @@ mod tests {
         assert!(lp.is_some());
         let pt = lp.unwrap();
         assert!(pt.is_finite());
-        assert!(pt.x >= 0.0 && pt.x <= 10.0 && pt.y >= 0.0 && pt.y <= 10.0);
+        assert!(pt.x > 0.0 && pt.x < 10.0 && pt.y > 0.0 && pt.y < 10.0);
     }
 
     #[test]

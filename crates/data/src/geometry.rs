@@ -412,6 +412,10 @@ pub fn seg_dist2(line: &[Coord], p: Coord) -> f64 {
 }
 
 /// Whether a line segment intersects an extent (including crossing through it or touching boundaries).
+///
+/// Returns `false` if `e` is empty, or if either coordinate is non-finite (`NaN` or `Infinity`)
+/// unless an endpoint is already contained within `e`. Non-finite endpoints outside the extent
+/// are treated as invalid and do not intersect.
 pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
     if e.is_empty() {
         return false;
@@ -503,6 +507,10 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 }
 
 /// Planar centroid of a ring (vertex average when degenerate).
+///
+/// Returns `None` if the ring contains non-finite coordinates or has no vertices.
+/// For degenerate rings with zero or near-zero planar area, returns the unweighted average
+/// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
     if !ring.iter().all(|c| c.is_finite()) {
         return None;
@@ -576,6 +584,7 @@ mod tests {
         // Non-finite segment outside the box or empty extent never intersects
         assert!(!segment_intersects_extent(Coord::new(f64::NAN, -1.0), Coord::new(5.0, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(-5.0, -5.0), Coord::new(f64::INFINITY, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(!segment_intersects_extent(Coord::new(-5.0, 5.0), Coord::new(f64::INFINITY, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
 

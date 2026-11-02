@@ -516,7 +516,7 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 /// Planar centroid of a ring (vertex average when degenerate).
 ///
 /// Returns `None` if the ring contains non-finite coordinates or has no vertices.
-/// Extreme coordinate magnitudes are scaled automatically to prevent floating-point overflow.
+/// Large coordinate magnitudes (> 1e100) are scaled down automatically to prevent floating-point overflow.
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
@@ -535,7 +535,7 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
         return Some(Coord::new(0.0, 0.0));
     }
 
-    let scale = if max_c > 1e100 || (max_c < 1e-100 && max_c > 0.0) { 1.0 / max_c } else { 1.0 };
+    let scale = if max_c > 1e100 { 1.0 / max_c } else { 1.0 };
     let pts = if n > 1 && ring.first() == ring.last() { ring.get(..n - 1).unwrap_or(ring) } else { ring };
 
     let mut a = 0.0f64;
@@ -644,6 +644,8 @@ mod tests {
         assert!(c.x.abs() < 1e145 && (c.y - 1e160 / 3.0).abs() / 1e160 < 1e-12);
         let max_ring = vec![Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0)];
         assert_eq!(ring_centroid(&max_ring), Some(Coord::new(f64::MAX, 0.0)));
+        let subnormal_ring = vec![Coord::new(5e-324, 0.0), Coord::new(0.0, 5e-324), Coord::new(-5e-324, 0.0), Coord::new(5e-324, 0.0)];
+        assert!(ring_centroid(&subnormal_ring).is_some());
     }
 
     #[test]

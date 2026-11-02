@@ -435,7 +435,7 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
     }
 
     let max_abs = p1.x.abs().max(p1.y.abs()).max(p2.x.abs().max(p2.y.abs()));
-    let (p1, p2, min_x, max_x, min_y, max_y) = if max_abs > 1e300 {
+    let (p1, p2, min_x, max_x, min_y, max_y) = if max_abs > f64::MAX / 2.0 {
         (Coord::new(p1.x * 0.5, p1.y * 0.5), Coord::new(p2.x * 0.5, p2.y * 0.5), e.min_x * 0.5, e.max_x * 0.5, e.min_y * 0.5, e.max_y * 0.5)
     } else {
         (p1, p2, e.min_x, e.max_x, e.min_y, e.max_y)
@@ -515,7 +515,7 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 
 /// Planar centroid of a ring (vertex average when degenerate).
 ///
-/// Returns `None` if the ring contains non-finite coordinates or has no vertices.
+/// Returns `None` if the ring contains non-finite coordinates, has no vertices, or produces a non-finite centroid.
 /// Large coordinate magnitudes (> 1e100) are scaled down automatically to prevent floating-point overflow.
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
@@ -564,8 +564,7 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
         cx += (px + qx) * f;
         cy += (py + qy) * f;
     }
-    let factor = 1.0 / (6.0 * a);
-    let c = Coord::new((cx * factor) / scale, (cy * factor) / scale);
+    let c = Coord::new((cx / (6.0 * a)) / scale, (cy / (6.0 * a)) / scale);
     c.is_finite().then_some(c)
 }
 
@@ -625,6 +624,7 @@ mod tests {
         assert!(segment_intersects_extent(Coord::new(-1.7e308, 5.0), Coord::new(1.7e308, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         // Subnormal values preserve precision without collapsing to zero
         assert!(!segment_intersects_extent(Coord::new(0.0, 5e-324), Coord::new(5e-324, 0.0), &Extent::new(0.0, 0.0, 0.0, 0.0)));
+        assert!(segment_intersects_extent(Coord::new(1e301, 0.0), Coord::new(-1e301, 1e-323), &Extent::new(0.0, 0.0, 10.0, 5e-324)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
 

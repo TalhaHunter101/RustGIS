@@ -146,8 +146,10 @@ impl Geometry {
                     aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
                 })?;
                 let outer = rings.first()?;
-                let c = ring_centroid(outer)?;
-                if polygon_contains(rings, c) {
+                let c = ring_centroid(outer);
+                if let Some(c) = c
+                    && polygon_contains(rings, c)
+                {
                     return Some(c);
                 }
                 // Scan a horizontal line through the centroid for the widest inside span.
@@ -182,7 +184,7 @@ impl Geometry {
                         }
                     }
                 }
-                best.map(|(_, c)| c).or(Some(c))
+                best.map(|(_, pt)| pt).or(c)
             }
         }
     }
@@ -436,6 +438,9 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
 
     let dx = p2.x - p1.x;
     let dy = p2.y - p1.y;
+    if !dx.is_finite() || !dy.is_finite() {
+        return false;
+    }
     let mut t0 = 0.0f64;
     let mut t1 = 1.0f64;
 
@@ -533,7 +538,8 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
         cx += (p.x + q.x) * f;
         cy += (p.y + q.y) * f;
     }
-    Some(Coord::new(cx / (6.0 * a), cy / (6.0 * a)))
+    let centroid = Coord::new(cx / (6.0 * a), cy / (6.0 * a));
+    if centroid.is_finite() { Some(centroid) } else { None }
 }
 
 #[cfg(test)]
@@ -585,6 +591,7 @@ mod tests {
         assert!(!segment_intersects_extent(Coord::new(f64::NAN, -1.0), Coord::new(5.0, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(-5.0, -5.0), Coord::new(f64::INFINITY, 15.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(-5.0, 5.0), Coord::new(f64::INFINITY, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(!segment_intersects_extent(Coord::new(-1e308, 20.0), Coord::new(1e308, 20.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
 
@@ -599,6 +606,25 @@ mod tests {
         let non_finite = vec![Coord::new(f64::NAN, 0.0), Coord::new(10.0, 0.0), Coord::new(f64::NAN, 0.0)];
         assert_eq!(ring_centroid(&non_finite), None);
         assert_eq!(ring_centroid(&[]), None);
+        let huge_ring = vec![Coord::new(1e160, 0.0), Coord::new(0.0, 1e160), Coord::new(-1e160, 0.0), Coord::new(1e160, 0.0)];
+        assert_eq!(ring_centroid(&huge_ring), None);
+    }
+
+    #[test]
+    fn polygon_with_non_finite_vertex_uses_label_fallback() {
+        let poly = Geometry::Polygon(vec![vec![vec![
+            Coord::new(0.0, 0.0),
+            Coord::new(10.0, 0.0),
+            Coord::new(10.0, 10.0),
+            Coord::new(0.0, 10.0),
+            Coord::new(f64::NAN, f64::NAN),
+            Coord::new(0.0, 0.0),
+        ]]]);
+        let lp = poly.label_point();
+        assert!(lp.is_some());
+        let pt = lp.unwrap();
+        assert!(pt.is_finite());
+        assert!(pt.x >= 0.0 && pt.x <= 10.0 && pt.y >= 0.0 && pt.y <= 10.0);
     }
 
     #[test]
@@ -718,8 +744,10 @@ mod label_scanline_tests {
                     aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
                 })?;
                 let outer = rings.first()?;
-                let c = ring_centroid(outer)?;
-                if polygon_contains(rings, c) {
+                let c = ring_centroid(outer);
+                if let Some(c) = c
+                    && polygon_contains(rings, c)
+                {
                     return Some(c);
                 }
                 // Scan a horizontal line through the centroid for the widest inside span.
@@ -749,7 +777,7 @@ mod label_scanline_tests {
                         }
                     }
                 }
-                best.map(|(_, c)| c).or(Some(c))
+                best.map(|(_, pt)| pt).or(c)
             }
         }
     }

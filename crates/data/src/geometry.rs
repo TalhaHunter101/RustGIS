@@ -545,7 +545,7 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
     }
     a /= 2.0;
 
-    if a.abs() < 1e-12 {
+    if a == 0.0 || a.abs() < 1e-12 * scale * scale {
         let count = pts.len() as f64;
         if count == 0.0 {
             return None;
@@ -646,6 +646,18 @@ mod tests {
         assert_eq!(ring_centroid(&max_ring), Some(Coord::new(f64::MAX, 0.0)));
         let subnormal_ring = vec![Coord::new(5e-324, 0.0), Coord::new(0.0, 5e-324), Coord::new(-5e-324, 0.0), Coord::new(5e-324, 0.0)];
         assert!(ring_centroid(&subnormal_ring).is_some());
+    }
+
+    #[test]
+    fn ring_centroid_scale_threshold_continuity() {
+        let p_below =
+            vec![Coord::new(0.0, 0.0), Coord::new(1e99, 0.0), Coord::new(1e99, 1e99), Coord::new(0.0, 1e99), Coord::new(0.0, 0.0)];
+        let p_above =
+            vec![Coord::new(0.0, 0.0), Coord::new(1e101, 0.0), Coord::new(1e101, 1e101), Coord::new(0.0, 1e101), Coord::new(0.0, 0.0)];
+        let c_below = ring_centroid(&p_below).unwrap();
+        let c_above = ring_centroid(&p_above).unwrap();
+        assert!((c_below.x - 5e98).abs() / 5e98 < 1e-12);
+        assert!((c_above.x - 5e100).abs() / 5e100 < 1e-12);
     }
 
     #[test]

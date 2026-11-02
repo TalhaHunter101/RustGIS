@@ -130,10 +130,9 @@ impl Geometry {
     }
 
     /// A point for a label or a pop-up: the point itself, the middle vertex of the longest line
-    /// part, or the centroid of the largest polygon (moved inside it if the centroid falls out).
+    /// part, or the centroid of the largest valid polygon (moved inside it if the centroid falls out).
     ///
-    /// Returns `None` if the geometry is empty or if polygon rings contain non-finite coordinates,
-    /// in which case no valid interior label point can be computed (producing blank/Null label values in exports).
+    /// Returns `None` if the geometry is empty or if all polygon parts contain non-finite coordinates.
     pub fn label_point(&self) -> Option<Coord> {
         match self {
             Geometry::Point(c) => Some(*c),
@@ -143,7 +142,7 @@ impl Geometry {
                 part.get(part.len() / 2).copied()
             }
             Geometry::Polygon(polys) => {
-                let rings = polys.iter().filter(|p| p.first().is_some_and(|r| r.iter().all(|c| c.is_finite()))).max_by(|a, b| {
+                let rings = polys.iter().filter(|p| p.iter().all(|r| r.iter().all(|c| c.is_finite()))).max_by(|a, b| {
                     let aa = a.first().map(|r| ring_area(r).abs()).unwrap_or(0.0);
                     let bb = b.first().map(|r| ring_area(r).abs()).unwrap_or(0.0);
                     aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
@@ -437,13 +436,11 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         return false;
     }
 
-    let max_abs_x = p1.x.abs().max(p2.x.abs());
-    let (p1x, p2x, min_x, max_x) =
-        if max_abs_x > f64::MAX / 2.0 { (p1.x * 0.5, p2.x * 0.5, e.min_x * 0.5, e.max_x * 0.5) } else { (p1.x, p2.x, e.min_x, e.max_x) };
-
-    let max_abs_y = p1.y.abs().max(p2.y.abs());
-    let (p1y, p2y, min_y, max_y) =
-        if max_abs_y > f64::MAX / 2.0 { (p1.y * 0.5, p2.y * 0.5, e.min_y * 0.5, e.max_y * 0.5) } else { (p1.y, p2.y, e.min_y, e.max_y) };
+    let halve_axis = |v1: f64, v2: f64, min_e: f64, max_e: f64| {
+        if v1.abs().max(v2.abs()) > f64::MAX / 2.0 { (v1 * 0.5, v2 * 0.5, min_e * 0.5, max_e * 0.5) } else { (v1, v2, min_e, max_e) }
+    };
+    let (p1x, p2x, min_x, max_x) = halve_axis(p1.x, p2.x, e.min_x, e.max_x);
+    let (p1y, p2y, min_y, max_y) = halve_axis(p1.y, p2.y, e.min_y, e.max_y);
 
     let dx = p2x - p1x;
     let dy = p2y - p1y;
@@ -524,52 +521,55 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
-    let mut max_c = 0.0f64;
+    let mut max_x = 0.0f64;
+    let mut max_y = 0.0f64;
     for c in ring {
         if !c.is_finite() {
             return None;
         }
-        max_c = max_c.max(c.x.abs().max(c.y.abs()));
+        max_x = max_x.max(c.x.abs());
+        max_y = max_y.max(c.y.abs());
     }
     let n = ring.len();
     if n == 0 {
         return None;
     }
-    if max_c == 0.0 {
+    if max_x == 0.0 && max_y == 0.0 {
         return Some(Coord::new(0.0, 0.0));
     }
 
-    let scale = if max_c > 1e100 { 1.0 / max_c } else { 1.0 };
+    let scale_x = if max_x > 1e100 { 1.0 / max_x } else { 1.0 };
+    let scale_y = if max_y > 1e100 { 1.0 / max_y } else { 1.0 };
     let pts = if n > 1 && ring.first() == ring.last() { ring.get(..n - 1).unwrap_or(ring) } else { ring };
 
     let mut a = 0.0f64;
     for i in 0..n {
         let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
-        a += (p.x * scale) * (q.y * scale) - (q.x * scale) * (p.y * scale);
+        a += (p.x * scale_x) * (q.y * scale_y) - (q.x * scale_x) * (p.y * scale_y);
     }
     a /= 2.0;
 
-    let degenerate_threshold = (1e-12 * scale * scale).max(f64::MIN_POSITIVE);
+    let degenerate_threshold = (1e-12 * scale_x * scale_y).max(f64::MIN_POSITIVE);
     if a == 0.0 || a.abs() < degenerate_threshold {
         let count = pts.len() as f64;
         if count == 0.0 {
             return None;
         }
-        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x * scale, y + c.y * scale));
-        let c = Coord::new((sx / count) / scale, (sy / count) / scale);
+        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x * scale_x, y + c.y * scale_y));
+        let c = Coord::new((sx / count) / scale_x, (sy / count) / scale_y);
         return c.is_finite().then_some(c);
     }
 
     let (mut cx, mut cy) = (0.0, 0.0);
     for i in 0..n {
         let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
-        let (px, py) = (p.x * scale, p.y * scale);
-        let (qx, qy) = (q.x * scale, q.y * scale);
+        let (px, py) = (p.x * scale_x, p.y * scale_y);
+        let (qx, qy) = (q.x * scale_x, q.y * scale_y);
         let f = px * qy - qx * py;
         cx += (px + qx) * f;
         cy += (py + qy) * f;
     }
-    let c = Coord::new((cx / (6.0 * a)) / scale, (cy / (6.0 * a)) / scale);
+    let c = Coord::new((cx / (6.0 * a)) / scale_x, (cy / (6.0 * a)) / scale_y);
     c.is_finite().then_some(c)
 }
 
@@ -652,6 +652,10 @@ mod tests {
         assert_eq!(ring_centroid(&max_ring), Some(Coord::new(f64::MAX, 0.0)));
         let subnormal_ring = vec![Coord::new(5e-324, 0.0), Coord::new(0.0, 5e-324), Coord::new(-5e-324, 0.0), Coord::new(5e-324, 0.0)];
         assert!(ring_centroid(&subnormal_ring).is_some());
+        let mixed_ring = vec![Coord::new(1e200, 1e-200), Coord::new(1e200, 2e-200), Coord::new(1e200, 3e-200), Coord::new(1e200, 1e-200)];
+        let c_mixed = ring_centroid(&mixed_ring).unwrap();
+        assert!((c_mixed.x - 1e200).abs() / 1e200 < 1e-12);
+        assert!((c_mixed.y - 2e-200).abs() / 2e-200 < 1e-12);
     }
 
     #[test]
@@ -685,9 +689,14 @@ mod tests {
         let valid_square = vec![square(0.0, 0.0, 10.0)];
         let corrupt_poly = vec![vec![Coord::new(0.0, 0.0), Coord::new(f64::NAN, 0.0), Coord::new(10.0, 10.0), Coord::new(0.0, 0.0)]];
         let mp1 = Geometry::Polygon(vec![valid_square.clone(), corrupt_poly.clone()]);
-        let mp2 = Geometry::Polygon(vec![corrupt_poly, valid_square]);
+        let mp2 = Geometry::Polygon(vec![corrupt_poly, valid_square.clone()]);
         assert_eq!(mp1.label_point(), Some(Coord::new(5.0, 5.0)));
         assert_eq!(mp2.label_point(), Some(Coord::new(5.0, 5.0)));
+
+        // A polygon with a corrupt hole is also rejected in favor of a valid polygon
+        let poly_corrupt_hole = vec![square(0.0, 0.0, 20.0), vec![Coord::new(5.0, 5.0), Coord::new(f64::NAN, 5.0), Coord::new(5.0, 5.0)]];
+        let mp_hole = Geometry::Polygon(vec![poly_corrupt_hole, valid_square]);
+        assert_eq!(mp_hole.label_point(), Some(Coord::new(5.0, 5.0)));
     }
 
     #[test]

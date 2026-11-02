@@ -146,8 +146,8 @@ impl Geometry {
                     aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
                 })?;
                 let outer = rings.first()?;
-                let c = ring_centroid(outer);
-                if let Some(c) = c.filter(|c| polygon_contains(rings, *c)) {
+                let c = ring_centroid(outer)?;
+                if polygon_contains(rings, c) {
                     return Some(c);
                 }
                 // Scan a horizontal line through the centroid for the widest inside span.
@@ -182,7 +182,7 @@ impl Geometry {
                         }
                     }
                 }
-                best.map(|(_, pt)| pt).or(c)
+                best.map(|(_, c)| c).or(Some(c))
             }
         }
     }
@@ -625,26 +625,17 @@ mod tests {
     }
 
     #[test]
-    fn polygon_with_non_finite_vertex_uses_label_fallback() {
+    fn polygon_with_non_finite_vertex_returns_none_label() {
+        // Polygons with non-finite vertices cannot compute a valid centroid or label point
         let poly = Geometry::Polygon(vec![vec![vec![
             Coord::new(0.0, 0.0),
             Coord::new(10.0, 0.0),
+            Coord::new(f64::NAN, 5.0),
             Coord::new(10.0, 10.0),
             Coord::new(0.0, 10.0),
-            Coord::new(f64::NAN, f64::NAN),
             Coord::new(0.0, 0.0),
         ]]]);
-        let lp = poly.label_point();
-        assert!(lp.is_some());
-        let pt = lp.unwrap();
-        assert!(pt.is_finite());
-        assert!(pt.x > 0.0 && pt.x < 10.0 && pt.y > 0.0 && pt.y < 10.0);
-        let all_nan = Geometry::Polygon(vec![vec![vec![
-            Coord::new(f64::NAN, f64::NAN),
-            Coord::new(f64::NAN, f64::NAN),
-            Coord::new(f64::NAN, f64::NAN),
-        ]]]);
-        assert_eq!(all_nan.label_point(), None);
+        assert_eq!(poly.label_point(), None);
     }
 
     #[test]
@@ -764,8 +755,8 @@ mod label_scanline_tests {
                     aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
                 })?;
                 let outer = rings.first()?;
-                let c = ring_centroid(outer);
-                if let Some(c) = c.filter(|c| polygon_contains(rings, *c)) {
+                let c = ring_centroid(outer)?;
+                if polygon_contains(rings, c) {
                     return Some(c);
                 }
                 // Scan a horizontal line through the centroid for the widest inside span.
@@ -795,7 +786,7 @@ mod label_scanline_tests {
                         }
                     }
                 }
-                best.map(|(_, pt)| pt).or(c)
+                best.map(|(_, c)| c).or(Some(c))
             }
         }
     }

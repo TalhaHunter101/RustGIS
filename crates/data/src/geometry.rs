@@ -143,7 +143,7 @@ impl Geometry {
                 part.get(part.len() / 2).copied()
             }
             Geometry::Polygon(polys) => {
-                let rings = polys.iter().max_by(|a, b| {
+                let rings = polys.iter().filter(|p| p.first().is_some_and(|r| r.iter().all(|c| c.is_finite()))).max_by(|a, b| {
                     let aa = a.first().map(|r| ring_area(r).abs()).unwrap_or(0.0);
                     let bb = b.first().map(|r| ring_area(r).abs()).unwrap_or(0.0);
                     aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
@@ -437,15 +437,16 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         return false;
     }
 
-    let max_abs = p1.x.abs().max(p1.y.abs()).max(p2.x.abs().max(p2.y.abs()));
-    let (p1, p2, min_x, max_x, min_y, max_y) = if max_abs > f64::MAX / 2.0 {
-        (Coord::new(p1.x * 0.5, p1.y * 0.5), Coord::new(p2.x * 0.5, p2.y * 0.5), e.min_x * 0.5, e.max_x * 0.5, e.min_y * 0.5, e.max_y * 0.5)
-    } else {
-        (p1, p2, e.min_x, e.max_x, e.min_y, e.max_y)
-    };
+    let max_abs_x = p1.x.abs().max(p2.x.abs());
+    let (p1x, p2x, min_x, max_x) =
+        if max_abs_x > f64::MAX / 2.0 { (p1.x * 0.5, p2.x * 0.5, e.min_x * 0.5, e.max_x * 0.5) } else { (p1.x, p2.x, e.min_x, e.max_x) };
 
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
+    let max_abs_y = p1.y.abs().max(p2.y.abs());
+    let (p1y, p2y, min_y, max_y) =
+        if max_abs_y > f64::MAX / 2.0 { (p1.y * 0.5, p2.y * 0.5, e.min_y * 0.5, e.max_y * 0.5) } else { (p1.y, p2.y, e.min_y, e.max_y) };
+
+    let dx = p2x - p1x;
+    let dy = p2y - p1y;
     let mut t0 = 0.0f64;
     let mut t1 = 1.0f64;
 
@@ -472,7 +473,7 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         true
     };
 
-    clip(-dx, p1.x - min_x) && clip(dx, max_x - p1.x) && clip(-dy, p1.y - min_y) && clip(dy, max_y - p1.y) && t0 <= t1
+    clip(-dx, p1x - min_x) && clip(dx, max_x - p1x) && clip(-dy, p1y - min_y) && clip(dy, max_y - p1y) && t0 <= t1
 }
 
 /// Even-odd point-in-ring test.
@@ -548,7 +549,8 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
     }
     a /= 2.0;
 
-    if a == 0.0 || a.abs() < 1e-12 * scale * scale {
+    let degenerate_threshold = (1e-12 * scale * scale).max(f64::MIN_POSITIVE);
+    if a == 0.0 || a.abs() < degenerate_threshold {
         let count = pts.len() as f64;
         if count == 0.0 {
             return None;
@@ -628,6 +630,7 @@ mod tests {
         // Subnormal values preserve precision without collapsing to zero
         assert!(!segment_intersects_extent(Coord::new(0.0, 5e-324), Coord::new(5e-324, 0.0), &Extent::new(0.0, 0.0, 0.0, 0.0)));
         assert!(segment_intersects_extent(Coord::new(1e301, 0.0), Coord::new(-1e301, 1e-323), &Extent::new(0.0, 0.0, 10.0, 5e-324)));
+        assert!(!segment_intersects_extent(Coord::new(1.7e308, 5e-324), Coord::new(-1.7e308, 5e-324), &Extent::new(0.0, 0.0, 0.0, 0.0)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
 
@@ -675,6 +678,16 @@ mod tests {
             Coord::new(0.0, 0.0),
         ]]]);
         assert_eq!(poly.label_point(), None);
+    }
+
+    #[test]
+    fn multipolygon_with_one_corrupt_part_labels_valid_part() {
+        let valid_square = vec![square(0.0, 0.0, 10.0)];
+        let corrupt_poly = vec![vec![Coord::new(0.0, 0.0), Coord::new(f64::NAN, 0.0), Coord::new(10.0, 10.0), Coord::new(0.0, 0.0)]];
+        let mp1 = Geometry::Polygon(vec![valid_square.clone(), corrupt_poly.clone()]);
+        let mp2 = Geometry::Polygon(vec![corrupt_poly, valid_square]);
+        assert_eq!(mp1.label_point(), Some(Coord::new(5.0, 5.0)));
+        assert_eq!(mp2.label_point(), Some(Coord::new(5.0, 5.0)));
     }
 
     #[test]

@@ -131,6 +131,9 @@ impl Geometry {
 
     /// A point for a label or a pop-up: the point itself, the middle vertex of the longest line
     /// part, or the centroid of the largest polygon (moved inside it if the centroid falls out).
+    ///
+    /// Returns `None` if the geometry is empty or if polygon rings contain non-finite coordinates,
+    /// in which case no valid interior label point can be computed (producing blank/Null label values in exports).
     pub fn label_point(&self) -> Option<Coord> {
         match self {
             Geometry::Point(c) => Some(*c),

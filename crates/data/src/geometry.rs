@@ -434,19 +434,15 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         return false;
     }
 
-    // Halve coordinates and bounds so differences and q terms cannot overflow f64::MAX.
-    // In Liang-Barsky, ratios q / p cancel the common 0.5 factor exactly.
-    let h_p1_x = p1.x * 0.5;
-    let h_p1_y = p1.y * 0.5;
-    let h_p2_x = p2.x * 0.5;
-    let h_p2_y = p2.y * 0.5;
-    let h_min_x = e.min_x * 0.5;
-    let h_max_x = e.max_x * 0.5;
-    let h_min_y = e.min_y * 0.5;
-    let h_max_y = e.max_y * 0.5;
+    let max_abs = p1.x.abs().max(p1.y.abs()).max(p2.x.abs().max(p2.y.abs()));
+    let (p1, p2, min_x, max_x, min_y, max_y) = if max_abs > 1e300 {
+        (Coord::new(p1.x * 0.5, p1.y * 0.5), Coord::new(p2.x * 0.5, p2.y * 0.5), e.min_x * 0.5, e.max_x * 0.5, e.min_y * 0.5, e.max_y * 0.5)
+    } else {
+        (p1, p2, e.min_x, e.max_x, e.min_y, e.max_y)
+    };
 
-    let dx = h_p2_x - h_p1_x;
-    let dy = h_p2_y - h_p1_y;
+    let dx = p2.x - p1.x;
+    let dy = p2.y - p1.y;
     let mut t0 = 0.0f64;
     let mut t1 = 1.0f64;
 
@@ -473,7 +469,7 @@ pub fn segment_intersects_extent(p1: Coord, p2: Coord, e: &Extent) -> bool {
         true
     };
 
-    clip(-dx, h_p1_x - h_min_x) && clip(dx, h_max_x - h_p1_x) && clip(-dy, h_p1_y - h_min_y) && clip(dy, h_max_y - h_p1_y) && t0 <= t1
+    clip(-dx, p1.x - min_x) && clip(dx, max_x - p1.x) && clip(-dy, p1.y - min_y) && clip(dy, max_y - p1.y) && t0 <= t1
 }
 
 /// Even-odd point-in-ring test.
@@ -519,35 +515,58 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
 
 /// Planar centroid of a ring (vertex average when degenerate).
 ///
-/// Returns `None` if the ring contains non-finite coordinates, has no vertices, or if floating-point
-/// coordinate sums or cross products overflow `f64`.
+/// Returns `None` if the ring contains non-finite coordinates or has no vertices.
+/// Extreme coordinate magnitudes are scaled automatically to prevent floating-point overflow.
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
-    if !ring.iter().all(|c| c.is_finite()) {
-        return None;
-    }
-    let a = ring_area(ring);
-    if a.abs() < 1e-12 {
-        let pts = if ring.len() > 1 && ring.first() == ring.last() { ring.get(..ring.len() - 1).unwrap_or(ring) } else { ring };
-        let n = pts.len() as f64;
-        if n == 0.0 {
+    let mut max_c = 0.0f64;
+    for c in ring {
+        if !c.is_finite() {
             return None;
         }
-        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x, y + c.y));
-        let c = Coord::new(sx / n, sy / n);
-        return c.is_finite().then_some(c);
+        max_c = max_c.max(c.x.abs().max(c.y.abs()));
     }
     let n = ring.len();
+    if n == 0 {
+        return None;
+    }
+    if max_c == 0.0 {
+        return Some(Coord::new(0.0, 0.0));
+    }
+
+    let scale = if max_c > 1e100 || (max_c < 1e-100 && max_c > 0.0) { 1.0 / max_c } else { 1.0 };
+    let pts = if n > 1 && ring.first() == ring.last() { ring.get(..n - 1).unwrap_or(ring) } else { ring };
+
+    let mut a = 0.0f64;
+    for i in 0..n {
+        let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
+        a += (p.x * scale) * (q.y * scale) - (q.x * scale) * (p.y * scale);
+    }
+    a /= 2.0;
+
+    if a.abs() < 1e-12 {
+        let count = pts.len() as f64;
+        if count == 0.0 {
+            return None;
+        }
+        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x * scale, y + c.y * scale));
+        let c = Coord::new((sx / count) / scale, (sy / count) / scale);
+        return c.is_finite().then_some(c);
+    }
+
     let (mut cx, mut cy) = (0.0, 0.0);
     for i in 0..n {
         let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
-        let f = p.x * q.y - q.x * p.y;
-        cx += (p.x + q.x) * f;
-        cy += (p.y + q.y) * f;
+        let (px, py) = (p.x * scale, p.y * scale);
+        let (qx, qy) = (q.x * scale, q.y * scale);
+        let f = px * qy - qx * py;
+        cx += (px + qx) * f;
+        cy += (py + qy) * f;
     }
-    let centroid = Coord::new(cx / (6.0 * a), cy / (6.0 * a));
-    centroid.is_finite().then_some(centroid)
+    let factor = 1.0 / (6.0 * a);
+    let c = Coord::new((cx * factor) / scale, (cy * factor) / scale);
+    c.is_finite().then_some(c)
 }
 
 #[cfg(test)]
@@ -604,6 +623,8 @@ mod tests {
         // Passes bounding-box check; dx = 3.4e308 would overflow without halving and wrongly report a hit
         assert!(!segment_intersects_extent(Coord::new(-1.7e308, 5.0), Coord::new(1.7e308, 20.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(segment_intersects_extent(Coord::new(-1.7e308, 5.0), Coord::new(1.7e308, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        // Subnormal values preserve precision without collapsing to zero
+        assert!(!segment_intersects_extent(Coord::new(0.0, 5e-324), Coord::new(5e-324, 0.0), &Extent::new(0.0, 0.0, 0.0, 0.0)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
 
@@ -619,9 +640,10 @@ mod tests {
         assert_eq!(ring_centroid(&non_finite), None);
         assert_eq!(ring_centroid(&[]), None);
         let huge_ring = vec![Coord::new(1e160, 0.0), Coord::new(0.0, 1e160), Coord::new(-1e160, 0.0), Coord::new(1e160, 0.0)];
-        assert_eq!(ring_centroid(&huge_ring), None);
-        let overflow = vec![Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0)];
-        assert_eq!(ring_centroid(&overflow), None);
+        let c = ring_centroid(&huge_ring).unwrap();
+        assert!(c.x.abs() < 1e145 && (c.y - 1e160 / 3.0).abs() / 1e160 < 1e-12);
+        let max_ring = vec![Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0), Coord::new(f64::MAX, 0.0)];
+        assert_eq!(ring_centroid(&max_ring), Some(Coord::new(f64::MAX, 0.0)));
     }
 
     #[test]

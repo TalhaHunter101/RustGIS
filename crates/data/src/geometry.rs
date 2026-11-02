@@ -147,9 +147,7 @@ impl Geometry {
                 })?;
                 let outer = rings.first()?;
                 let c = ring_centroid(outer);
-                if let Some(c) = c
-                    && polygon_contains(rings, c)
-                {
+                if let Some(c) = c.filter(|c| polygon_contains(rings, *c)) {
                     return Some(c);
                 }
                 // Scan a horizontal line through the centroid for the widest inside span.
@@ -549,7 +547,7 @@ pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
         cy += (p.y + q.y) * f;
     }
     let centroid = Coord::new(cx / (6.0 * a), cy / (6.0 * a));
-    if centroid.is_finite() { Some(centroid) } else { None }
+    centroid.is_finite().then_some(centroid)
 }
 
 #[cfg(test)]
@@ -603,6 +601,8 @@ mod tests {
         assert!(!segment_intersects_extent(Coord::new(-5.0, 5.0), Coord::new(f64::INFINITY, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         // Huge coordinates exceeding normal span: non-crossing returns false, crossing returns true
         assert!(!segment_intersects_extent(Coord::new(-1.7e308, 20.0), Coord::new(1.7e308, 20.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
+        // Passes bounding-box check; dx = 3.4e308 would overflow without halving and wrongly report a hit
+        assert!(!segment_intersects_extent(Coord::new(-1.7e308, 5.0), Coord::new(1.7e308, 20.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(segment_intersects_extent(Coord::new(-1.7e308, 5.0), Coord::new(1.7e308, 5.0), &Extent::new(0.0, 0.0, 10.0, 10.0)));
         assert!(!segment_intersects_extent(Coord::new(0.0, 0.0), Coord::new(10.0, 10.0), &Extent::EMPTY));
     }
@@ -639,6 +639,12 @@ mod tests {
         let pt = lp.unwrap();
         assert!(pt.is_finite());
         assert!(pt.x > 0.0 && pt.x < 10.0 && pt.y > 0.0 && pt.y < 10.0);
+        let all_nan = Geometry::Polygon(vec![vec![vec![
+            Coord::new(f64::NAN, f64::NAN),
+            Coord::new(f64::NAN, f64::NAN),
+            Coord::new(f64::NAN, f64::NAN),
+        ]]]);
+        assert_eq!(all_nan.label_point(), None);
     }
 
     #[test]
@@ -759,9 +765,7 @@ mod label_scanline_tests {
                 })?;
                 let outer = rings.first()?;
                 let c = ring_centroid(outer);
-                if let Some(c) = c
-                    && polygon_contains(rings, c)
-                {
+                if let Some(c) = c.filter(|c| polygon_contains(rings, *c)) {
                     return Some(c);
                 }
                 // Scan a horizontal line through the centroid for the widest inside span.

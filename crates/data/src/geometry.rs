@@ -226,7 +226,7 @@ impl Geometry {
             Geometry::Polygon(polys) => {
                 let rings = polys
                     .iter()
-                    .filter(|p| p.iter().all(|r| r.iter().all(|c| c.is_finite())))
+                    .filter(|p| !p.is_empty() && p.iter().all(|r| r.iter().all(|c| c.is_finite())))
                     .max_by(|a, b| ring_area_order(a.first().map_or(&[], Vec::as_slice), b.first().map_or(&[], Vec::as_slice)))?;
                 let outer = rings.first()?;
                 let c = ring_centroid(outer)?;
@@ -255,9 +255,13 @@ impl Geometry {
                         match (inside & (1u128 << j) != 0, run_start) {
                             (true, None) => run_start = Some(x),
                             (false, Some(s)) => {
-                                let w = x - s;
+                                // Half widths and a halved midpoint stay finite for spans past
+                                // f64::MAX; halving is exact, so ordinary runs rank the same.
+                                let w = x * 0.5 - s * 0.5;
                                 if best.is_none_or(|(bw, _)| w > bw) {
-                                    best = Some((w, Coord::new((s + x) / 2.0, y)));
+                                    let mid = (s + x) / 2.0;
+                                    let mid = if mid.is_finite() { mid } else { s * 0.5 + x * 0.5 };
+                                    best = Some((w, Coord::new(mid, y)));
                                 }
                                 run_start = None;
                             }
@@ -271,12 +275,12 @@ impl Geometry {
     }
 }
 
-/// The `k`th of the label grid's sample positions between `min` and `max`. A span too wide for
-/// `f64` (beyond `f64::MAX`) is interpolated instead, so the samples stay finite; ordinary spans
+/// The `k`th of the label grid's sample positions between `min` and `max`. A span whose samples
+/// would overflow `f64` is interpolated instead, so the samples stay finite; ordinary spans
 /// keep the original expression and its exact bits.
 fn grid_coord(min: f64, max: f64, k: usize) -> f64 {
     let span = max - min;
-    if span.is_finite() {
+    if (span * LABEL_GRID_STEPS as f64).is_finite() {
         return min + span * k as f64 / LABEL_GRID_STEPS as f64;
     }
     let t = k as f64 / LABEL_GRID_STEPS as f64;
@@ -590,7 +594,8 @@ pub fn ring_contains(ring: &[Coord], p: Coord) -> bool {
 /// other axis keep their precision.
 fn crossing_x(a: Coord, b: Coord, y: f64) -> f64 {
     let x = (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x;
-    if x.is_finite() {
+    // An overflowed denominator can still give a finite (wrong) quotient, so it is checked too.
+    if x.is_finite() && (b.y - a.y).is_finite() {
         return x;
     }
     let (ny, dy) = (y - a.y, b.y - a.y);
@@ -878,6 +883,44 @@ mod tests {
         assert!(!ring_contains(&ring, ring_centroid(&ring).unwrap()));
         let c = Geometry::Polygon(vec![vec![ring.clone()]]).label_point().unwrap();
         assert!(ring_contains(&ring, c), "{c:?}");
+    }
+
+    #[test]
+    fn huge_label_grid_and_crossings_stay_finite_and_inside() {
+        // Span 2e307 is finite, but span * k overflows for later samples.
+        let m = 1e307;
+        let u = [(-m, 0.0), (m, 0.0), (m, 3.0), (m / 3.0, 3.0), (m / 3.0, 1.0), (-m / 3.0, 1.0), (-m / 3.0, 3.0), (-m, 3.0), (-m, 0.0)];
+        let ring: Vec<Coord> = u.iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let c = Geometry::Polygon(vec![vec![ring.clone()]]).label_point().unwrap();
+        assert!(c.is_finite() && ring_contains(&ring, c), "{c:?}");
+        // A hole leaves a run whose endpoints sum past f64::MAX.
+        let outer = vec![
+            Coord::new(-1.5e308, 0.0),
+            Coord::new(1.5e308, 0.0),
+            Coord::new(1.5e308, 3.0),
+            Coord::new(-1.5e308, 3.0),
+            Coord::new(-1.5e308, 0.0),
+        ];
+        let hole = vec![
+            Coord::new(-1.4e308, 0.01),
+            Coord::new(1e308, 0.01),
+            Coord::new(1e308, 2.99),
+            Coord::new(-1.4e308, 2.99),
+            Coord::new(-1.4e308, 0.01),
+        ];
+        let rings = vec![outer, hole];
+        let c = Geometry::Polygon(vec![rings.clone()]).label_point().unwrap();
+        assert!(c.is_finite() && polygon_contains(&rings, c), "{c:?}");
+        // An edge whose y difference overflows: the crossing at y = 0 is x = 0.5, not 0.
+        let tri = vec![Coord::new(0.0, -f64::MAX), Coord::new(1.0, f64::MAX), Coord::new(1.0, 0.0)];
+        assert!(!ring_contains(&tri, Coord::new(0.25, 0.0)));
+        assert!(ring_contains(&tri, Coord::new(0.75, 0.0)));
+    }
+
+    #[test]
+    fn ringless_part_does_not_shadow_a_valid_part() {
+        let flat = vec![vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0), Coord::new(0.0, 0.0)]];
+        assert_eq!(Geometry::Polygon(vec![flat, vec![]]).label_point(), Some(Coord::new(5.0, 0.0)));
     }
 
     #[test]

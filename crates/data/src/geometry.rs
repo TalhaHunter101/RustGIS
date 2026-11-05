@@ -224,10 +224,7 @@ impl Geometry {
                 part.get(part.len() / 2).copied()
             }
             Geometry::Polygon(polys) => {
-                let rings = polys
-                    .iter()
-                    .filter(|p| p.first().is_some_and(|r| !r.is_empty()) && p.iter().all(|r| r.iter().all(|c| c.is_finite())))
-                    .max_by(|a, b| ring_area_order(a.first().map_or(&[], Vec::as_slice), b.first().map_or(&[], Vec::as_slice)))?;
+                let rings = largest_part(polys)?;
                 let outer = rings.first()?;
                 let c = ring_centroid(outer)?;
                 if polygon_contains(rings, c) {
@@ -679,20 +676,25 @@ impl RingFrame {
     }
 }
 
-/// Orders two rings by absolute area. When either ring needs a scaled [`RingFrame`] (coordinates
-/// above 1e100), both are compared by the logarithm of their frame area, so huge or far-offset
-/// rings rank by their true size rather than an overflowed or cancelled shoelace sum.
-fn ring_area_order(a: &[Coord], b: &[Coord]) -> std::cmp::Ordering {
-    let (fa, fb) = (RingFrame::new(a), RingFrame::new(b));
-    let plain = |f: &Option<RingFrame>| f.as_ref().is_none_or(|f| f.sx == 1.0 && f.sy == 1.0);
-    if plain(&fa) && plain(&fb) {
-        // Neither ring is scaled: the frame area is the plain shoelace area, bit for bit.
-        let area = |f: &Option<RingFrame>, r: &[Coord]| f.as_ref().map_or(0.0, |f| f.area(r).abs());
-        return area(&fa, a).partial_cmp(&area(&fb, b)).unwrap_or(std::cmp::Ordering::Equal);
-    }
-    let log_area =
-        |f: &Option<RingFrame>, r: &[Coord]| f.as_ref().map_or(f64::NEG_INFINITY, |f| f.area(r).abs().ln() - f.sx.ln() - f.sy.ln());
-    log_area(&fa, a).partial_cmp(&log_area(&fb, b)).unwrap_or(std::cmp::Ordering::Equal)
+/// The polygon part with the largest outer ring, skipping parts with no outer ring or with a
+/// non-finite coordinate in any ring. Each part's area is computed once in its [`RingFrame`]. When
+/// any part needs a scaled frame (coordinates above 1e100), parts are ranked by the logarithm of
+/// their area, so huge or far-offset rings rank by their true size rather than an overflowed or
+/// cancelled shoelace sum; otherwise by the plain shoelace area, bit for bit. Ties keep the last part.
+fn largest_part(polys: &[Vec<Vec<Coord>>]) -> Option<&Vec<Vec<Coord>>> {
+    let parts: Vec<(&Vec<Vec<Coord>>, RingFrame, f64)> = polys
+        .iter()
+        .filter(|p| p.iter().all(|r| r.iter().all(|c| c.is_finite())))
+        .filter_map(|p| {
+            let outer = p.first()?;
+            let f = RingFrame::new(outer)?;
+            let a = f.area(outer).abs();
+            Some((p, f, a))
+        })
+        .collect();
+    let scaled = parts.iter().any(|(_, f, _)| f.sx != 1.0 || f.sy != 1.0);
+    let key = |(_, f, a): &(&Vec<Vec<Coord>>, RingFrame, f64)| if scaled { a.ln() - f.sx.ln() - f.sy.ln() } else { *a };
+    parts.iter().max_by(|x, y| key(x).partial_cmp(&key(y)).unwrap_or(std::cmp::Ordering::Equal)).map(|(p, _, _)| *p)
 }
 
 /// Planar centroid of a ring (vertex average when degenerate).

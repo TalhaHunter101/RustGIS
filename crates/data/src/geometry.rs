@@ -564,12 +564,24 @@ pub fn ring_contains(ring: &[Coord], p: Coord) -> bool {
     let mut j = n - 1;
     for i in 0..n {
         let (Some(a), Some(b)) = (ring.get(i), ring.get(j)) else { break };
-        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+        if (a.y > p.y) != (b.y > p.y) && p.x < crossing_x(*a, *b, p.y) {
             inside = !inside;
         }
         j = i;
     }
     inside
+}
+
+/// Where the edge `a`–`b` crosses the horizontal line at `y`. When the plain formula overflows
+/// (coordinates near `f64::MAX`), it is recomputed on halved values, fraction first, and the result
+/// doubled back, so huge rings still give a finite crossing.
+fn crossing_x(a: Coord, b: Coord, y: f64) -> f64 {
+    let x = (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x;
+    if x.is_finite() {
+        return x;
+    }
+    let t = (y * 0.5 - a.y * 0.5) / (b.y * 0.5 - a.y * 0.5);
+    ((b.x * 0.5 - a.x * 0.5) * t + a.x * 0.5) * 2.0
 }
 
 /// Inside the exterior ring and outside every hole.
@@ -803,6 +815,13 @@ mod tests {
         let kite = vec![Coord::new(0.0, 0.0), Coord::new(1e-110, 0.0), Coord::new(1e200, 1e200), Coord::new(0.0, 1e-110)];
         let c = ring_centroid(&kite).unwrap();
         assert!((c.x / (1e200 / 3.0) - 1.0).abs() < 1e-3 && (c.y / (1e200 / 3.0) - 1.0).abs() < 1e-3, "{c:?}");
+    }
+
+    #[test]
+    fn ring_contains_handles_huge_coordinates() {
+        let ring = vec![Coord::new(1e200, 1e200), Coord::new(0.0, 0.0), Coord::new(0.0, 1e200), Coord::new(1e200, 1e200)];
+        assert!(!ring_contains(&ring, Coord::new(2e200, 5e199)));
+        assert!(ring_contains(&ring, Coord::new(1e199, 5e199)));
     }
 
     #[test]

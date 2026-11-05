@@ -663,8 +663,8 @@ impl RingFrame {
         Coord::new((x + self.ox) / self.sx, (y + self.oy) / self.sy)
     }
 
-    /// Signed shoelace area of `ring` in frame units.
-    fn area(&self, ring: &[Coord]) -> f64 {
+    /// Signed unhalved shoelace sum of `ring` in frame units.
+    fn shoelace_sum(&self, ring: &[Coord]) -> f64 {
         let n = ring.len();
         let mut a = 0.0f64;
         for i in 0..n {
@@ -672,7 +672,12 @@ impl RingFrame {
             let ((px, py), (qx, qy)) = (self.local(p), self.local(q));
             a += px * qy - qx * py;
         }
-        a / 2.0
+        a
+    }
+
+    /// Signed shoelace area of `ring` in frame units.
+    fn area(&self, ring: &[Coord]) -> f64 {
+        self.shoelace_sum(ring) / 2.0
     }
 }
 
@@ -682,19 +687,22 @@ impl RingFrame {
 /// their area, so huge or far-offset rings rank by their true size rather than an overflowed or
 /// cancelled shoelace sum; otherwise by the plain shoelace area, bit for bit. Ties keep the last part.
 fn largest_part(polys: &[Vec<Vec<Coord>>]) -> Option<&Vec<Vec<Coord>>> {
-    let parts: Vec<(&Vec<Vec<Coord>>, RingFrame, f64)> = polys
+    let parts: Vec<(&Vec<Vec<Coord>>, RingFrame, f64, f64)> = polys
         .iter()
         .filter(|p| p.iter().all(|r| r.iter().all(|c| c.is_finite())))
         .filter_map(|p| {
             let outer = p.first()?;
             let f = RingFrame::new(outer)?;
+            let sum = f.shoelace_sum(outer).abs();
             let a = f.area(outer).abs();
-            Some((p, f, a))
+            Some((p, f, sum, a))
         })
         .collect();
-    let scaled = parts.iter().any(|(_, f, _)| f.sx != 1.0 || f.sy != 1.0);
-    let key = |(_, f, a): &(&Vec<Vec<Coord>>, RingFrame, f64)| if scaled { a.ln() - f.sx.ln() - f.sy.ln() } else { *a };
-    parts.iter().max_by(|x, y| key(x).partial_cmp(&key(y)).unwrap_or(std::cmp::Ordering::Equal)).map(|(p, _, _)| *p)
+    let scaled = parts.iter().any(|(_, f, _, _)| f.sx != 1.0 || f.sy != 1.0);
+    let key = |(_, f, sum, a): &(&Vec<Vec<Coord>>, RingFrame, f64, f64)| {
+        if scaled { sum.ln() - 2.0f64.ln() - f.sx.ln() - f.sy.ln() } else { *a }
+    };
+    parts.iter().max_by(|x, y| key(x).partial_cmp(&key(y)).unwrap_or(std::cmp::Ordering::Equal)).map(|(p, _, _, _)| *p)
 }
 
 /// Planar centroid of a ring (vertex average when degenerate).
@@ -935,6 +943,19 @@ mod tests {
             let c = Geometry::Polygon(parts).label_point().unwrap();
             assert!(c.x > 1e160 && c.y > 1e160, "{c:?}");
         }
+    }
+
+    #[test]
+    fn largest_part_with_tiny_framed_shoelace_sum_does_not_underflow() {
+        let triangle = vec![vec![Coord::new(0.0, 0.0), Coord::new(1e308, 0.0), Coord::new(0.0, f64::from_bits(1)), Coord::new(0.0, 0.0)]];
+        let tiny_square = vec![square(0.0, 0.0, 1e-8)];
+        let polys = vec![tiny_square.clone(), triangle.clone()];
+        let best = largest_part(&polys);
+        assert_eq!(best, Some(&triangle));
+
+        let polys_rev = vec![triangle.clone(), tiny_square];
+        let best_rev = largest_part(&polys_rev);
+        assert_eq!(best_rev, Some(&triangle));
     }
 
     #[test]

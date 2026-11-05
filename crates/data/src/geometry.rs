@@ -694,7 +694,7 @@ fn largest_part(polys: &[Vec<Vec<Coord>>]) -> Option<&Vec<Vec<Coord>>> {
             let outer = p.first()?;
             let f = RingFrame::new(outer)?;
             let sum = f.shoelace_sum(outer).abs();
-            let a = f.area(outer).abs();
+            let a = sum / 2.0;
             Some((p, f, sum, a))
         })
         .collect();

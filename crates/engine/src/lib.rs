@@ -18,6 +18,7 @@ pub mod s3_keys;
 #[cfg(test)]
 mod s3_saved_tests;
 pub mod sample;
+pub mod service_logins;
 pub mod sources;
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,9 @@ use rustgis_map::{Camera, Map};
 use serde_json::Value;
 
 pub type CmdResult = Result<Value, String>;
+
+/// A download that landed read already: its layer, and what reading it skipped or noticed.
+pub(crate) type LandedRead = Box<(rustgis_data::Dataset, rustgis_data::ReadReport)>;
 
 /// A command.
 #[derive(Clone, Copy)]
@@ -291,6 +295,10 @@ pub enum Tool {
     CreatePolygon,
     /// Moves, inserts and deletes the vertices of the selected features.
     EditVertices,
+    /// Draws a line across the selected polygons to cut them (`edit.cutPolygon`).
+    CutPolygon,
+    /// Draws a line across the selected feature's boundary to reshape it (`edit.reshape`).
+    Reshape,
     /// Draws a graphic: the shape is one of [`GRAPHIC_TOOLS`]' shapes.
     Graphic(&'static str),
 }
@@ -325,6 +333,8 @@ impl Tool {
             Tool::CreateLine => "createLine",
             Tool::CreatePolygon => "createPolygon",
             Tool::EditVertices => "editVertices",
+            Tool::CutPolygon => "cutPolygon",
+            Tool::Reshape => "reshape",
             Tool::Graphic(shape) => GRAPHIC_TOOLS.iter().find(|g| g.0 == shape).map_or("graphicPoint", |g| g.1),
         }
     }
@@ -345,6 +355,8 @@ impl Tool {
             Tool::CreateLine,
             Tool::CreatePolygon,
             Tool::EditVertices,
+            Tool::CutPolygon,
+            Tool::Reshape,
         ]
         .into_iter()
         .find(|t| t.code().eq_ignore_ascii_case(s.trim()))
@@ -363,11 +375,18 @@ impl Tool {
             Tool::CreateLine => "Create Line",
             Tool::CreatePolygon => "Create Polygon",
             Tool::EditVertices => "Edit Vertices",
+            Tool::CutPolygon => "Cut Polygon",
+            Tool::Reshape => "Reshape",
             Tool::Graphic(shape) => GRAPHIC_TOOLS.iter().find(|g| g.0 == shape).map_or("Point", |g| g.2),
         }
     }
     pub fn creates(self) -> bool {
         matches!(self, Tool::CreatePoint | Tool::CreateLine | Tool::CreatePolygon)
+    }
+    /// Whether the tool draws a line or polygon that edits features: vertices snap, and can
+    /// follow an edge with Trace.
+    pub fn draws_edit(self) -> bool {
+        matches!(self, Tool::CreateLine | Tool::CreatePolygon | Tool::CutPolygon | Tool::Reshape)
     }
 }
 
@@ -394,6 +413,17 @@ pub struct GpRecord {
     /// The layers the run added (by name at the time).
     #[serde(default)]
     pub outputs: Vec<String>,
+}
+
+impl GpRecord {
+    /// The record with its messages scrubbed of login bindings and secrets: a tool's error can
+    /// quote a bound address, and history rows are saved with the project and exported.
+    pub(crate) fn scrubbed(mut self) -> Self {
+        for message in &mut self.messages {
+            *message = render::rustgis_tiles::logins::scrub(message);
+        }
+        self
+    }
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -477,13 +507,16 @@ struct PutAside {
     plugin_runs: Vec<cmd::gp::StartedRun>,
     downloading: Vec<u64>,
     downloaded: Vec<(u64, Vec<u8>)>,
+    landed_reads: Vec<(u64, LandedRead)>,
     url_requests: Vec<serde_json::Value>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
     /// A style of the project still loading, which mustn't move the next one's view.
-    style_view: Option<(String, Camera)>,
+    style_view: Option<(rustgis_map::TileLayer, Camera, u64)>,
     #[cfg(not(target_arch = "wasm32"))]
     sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
     trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
+    raster_results: Vec<(u64, cmd::workflows::Made)>,
+    raster_runs: Vec<u64>,
     edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
 }
 
@@ -521,9 +554,15 @@ pub struct Session {
     /// and login requests. S3 uses the same store through `DatabaseLogins::secret_store`.
     /// Never saved; see [`connections::DatabaseLogins`].
     pub database_logins: connections::DatabaseLogins,
+    /// The web-service logins this session made the ones sent to an origin, which the process's
+    /// fetches share: they end with it (see [`service_logins`]).
+    pub(crate) web_logins: service_logins::SessionLogins,
     /// How rasters added from now on are drawn (`raster.setDefaultStyle`; kept with the app's
     /// preferences, not the project).
     pub raster_defaults: rustgis_map::RasterDefaults,
+    /// The favourite arrangement of publication layouts (`layout.arrangement`, #1379): a name or a
+    /// corner for each surround, kept with the app's preferences, not the project.
+    pub layout_favourite: serde_json::Value,
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
@@ -542,11 +581,13 @@ pub struct Session {
     layer_selection_of: Option<u32>,
     /// Map view size in logical points (set by the UI each frame).
     pub view_size: (f64, f64),
-    /// A MapLibre style tile layer (by its address) whose own view the map goes to once it loads
-    /// (`map.addTiles` with `"view": true`), or a PMTiles archive whose bounds it goes to, and the
-    /// camera then: moved since, the map stays.
-    pub style_view: Option<(String, Camera)>,
+    /// A MapLibre style tile layer (the added layer snapshot) whose own view the map goes to once it loads
+    /// (`map.addTiles` with `"view": true`), or a PMTiles/MBTiles archive whose bounds it goes to, and the
+    /// camera and owning map instance then: moved or switched since, the map stays.
+    pub style_view: Option<(rustgis_map::TileLayer, Camera, u64)>,
     pub notices: Vec<Notice>,
+    /// Troubleshooting history, independent of the active pane, project files and undo.
+    pub diagnostics: rustgis_data::diagnostics::History,
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
     /// less those a failed command withdrew.
     notices_given: u64,
@@ -617,6 +658,8 @@ pub struct Session {
     /// the command fails ([`PutAside`]); and how deep commands run within commands now.
     put_aside: Option<Box<PutAside>>,
     depth: u32,
+    /// Only the command's registered id, never its parameters. Nested commands restore this.
+    diagnostic_source: Option<&'static str>,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -650,6 +693,9 @@ pub struct Session {
     downloading: Vec<u64>,
     /// Downloads that landed, waiting for `layer.addDownload`.
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
+    /// Downloads that landed already read (an ArcGIS layer's protocol buffer pages, joined),
+    /// waiting for `layer.addDownload` too.
+    pub(crate) landed_reads: Vec<(u64, LandedRead)>,
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
     pub(crate) url_requests: Vec<serde_json::Value>,
@@ -673,12 +719,23 @@ pub struct Session {
     /// Trends the app worked out on a thread, waiting for `cube.trend {"ran"}`: the id, the
     /// layers and how many dates (see [`cmd::cube::land`]).
     pub(crate) trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
+    /// Rasters the app made on a thread for an Analysis workflow, waiting for its command with
+    /// `{"ran"}` (see [`cmd::workflows::raster_land`]).
+    pub(crate) raster_results: Vec<(u64, cmd::workflows::Made)>,
+    /// The ids of the Analysis workflows running on a thread (see
+    /// [`cmd::workflows::raster_start`]), apart from the downloads'.
+    pub(crate) raster_runs: Vec<u64>,
     /// Set where nothing waits on a command but a shell (`rustgis-cli run`): long runs a command
     /// works out where it's called (a trend over a state from a data cube) take the app's larger
     /// bounds, as its panes do on a thread, and tell their progress (a share, 0 to 1, and 1 when
     /// one succeeds) through this. Python leaves it unset: a run there holds the interpreter's
     /// lock and can't be interrupted, so it keeps the Script pane's bounds.
     pub long_runs: Option<fn(&str, f64)>,
+    /// Set where a person at a terminal waits on a command (`rustgis-cli run` with stdin and
+    /// stderr a terminal), who can stop it with Ctrl-C: tools and rasters take no work cap
+    /// ([`rustgis_analysis::control::Control::stoppable`]). A program that calls it (an agent, a
+    /// CI job) may wait with a timeout, so there they keep their caps.
+    pub stoppable: bool,
 }
 
 /// The most `layer.addUrl` requests kept for the front end at a time.
@@ -824,6 +881,9 @@ impl Session {
         rustgis_plugins::tools::register();
         // FlatGeobuf and GeoParquet by their web address are read through the tile fetchers.
         render::rustgis_tiles::remote::install();
+        rustgis_data::diagnostics::set_clock(|| {
+            web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+        });
         Session {
             project,
             path: None,
@@ -838,7 +898,9 @@ impl Session {
             s3_bindings: std::collections::BTreeMap::new(),
             s3_pending: Vec::new(),
             database_logins: connections::DatabaseLogins::default(),
+            web_logins: service_logins::SessionLogins::new(),
             raster_defaults: rustgis_map::RasterDefaults::default(),
+            layout_favourite: serde_json::Value::String("classic".into()),
             registry: Registry { commands: cmd::all() },
             revision: 1,
             opened: 0,
@@ -849,6 +911,7 @@ impl Session {
             view_size: (1200.0, 720.0),
             style_view: None,
             notices: Vec::new(),
+            diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
             table_layer: None,
             table_standalone: None,
@@ -879,6 +942,7 @@ impl Session {
             merged: None,
             put_aside: None,
             depth: 0,
+            diagnostic_source: None,
             restorable: 0,
             actor: None,
             back: Vec::new(),
@@ -893,6 +957,7 @@ impl Session {
             plugin_panels: std::collections::BTreeMap::new(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
+            landed_reads: Vec::new(),
             url_requests: Vec::new(),
             file_outputs: Vec::new(),
             #[cfg(test)]
@@ -905,7 +970,10 @@ impl Session {
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: Vec::new(),
             trend_results: Vec::new(),
+            raster_results: Vec::new(),
+            raster_runs: Vec::new(),
             long_runs: None,
+            stoppable: false,
         }
     }
 
@@ -939,9 +1007,29 @@ impl Session {
     /// Hands over a download's bytes, for `layer.addDownload {"id"}`; `false` when it was dropped
     /// (another project was opened meanwhile).
     pub fn download_landed(&mut self, id: u64, bytes: Vec<u8>) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.downloaded.push((id, bytes));
+        }
+        landed
+    }
+
+    /// Hands over a download read already (an ArcGIS layer's protocol buffer pages, joined, see
+    /// [`ogc::Step::Decoded`](rustgis_data::ogc::Step::Decoded)), for `layer.addDownload {"id"}`
+    /// as [`Session::download_landed`] does.
+    pub fn download_landed_read(&mut self, id: u64, dataset: rustgis_data::Dataset, report: rustgis_data::ReadReport) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.landed_reads.push((id, Box::new((dataset, report))));
+        }
+        landed
+    }
+
+    /// Takes a download off those under way: `false` when it isn't one of them (another project
+    /// was opened meanwhile).
+    fn landed(&mut self, id: u64) -> bool {
         let Some(i) = self.downloading.iter().position(|d| *d == id) else { return false };
         self.downloading.remove(i);
-        self.downloaded.push((id, bytes));
         true
     }
 
@@ -965,11 +1053,17 @@ impl Session {
     /// requests the next is refused rather than silently dropping one already promised.
     pub fn request_url(&mut self, p: &serde_json::Value) -> Result<serde_json::Value, String> {
         let url = p.get("url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        if !self.url_requests.iter().any(|q| q == p) {
+        // The front end runs the queued request after the plugin's anonymous scope has ended.
+        // Keep its opt-out through probes, whole-file fallbacks and the eventual addDownload.
+        let mut p = std::borrow::Cow::Borrowed(p);
+        if self.web_logins.is_anonymous() {
+            p.to_mut().as_object_mut().ok_or("download parameters must be an object")?.insert("anonymous".into(), serde_json::json!(true));
+        }
+        if !self.url_requests.iter().any(|q| q == p.as_ref()) {
             if self.url_requests.len() >= MAX_URL_REQUESTS {
                 return Err(format!("{url}: {MAX_URL_REQUESTS} downloads are already waiting; try again when they have landed"));
             }
-            self.url_requests.push(p.clone());
+            self.url_requests.push(p.into_owned());
         }
         self.request_only = true;
         Ok(serde_json::json!({"pending": true, "url": url}))
@@ -1032,49 +1126,69 @@ impl Session {
     /// panic restores it. A command run by itself (not as a part of another) that changes the
     /// project, or reaches a file or a service, goes into the session's log (#797).
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
-        if self.depth > 0 {
-            return self.run_command(id, params);
-        }
-        // Undo and redo are logged with the step they take back or bring back.
-        let step = match id {
-            "edit.undo" => self.undo_label(),
-            "edit.redo" => self.redo_label(),
-            _ => None,
-        };
-        // A step that joins the last one (a held arrow key nudging an element: `merge_undo`) is
-        // one entry too, as it is one step to undo.
-        let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
-        let (at, start) = (project_log::now_ms(), web_time::Instant::now());
-        let res = self.run_command(id, params);
-        // A plugin's command waiting for its fetches answers `pending` and runs again when they
-        // land: logged then, once. (Another command's `pending`, a download the web app makes, is
-        // logged as it is asked for: nothing runs it again.)
-        let pending =
-            id.starts_with(rustgis_plugins::PREFIX) && res.as_ref().is_ok_and(|v| v.get("pending").and_then(Value::as_bool) == Some(true));
-        // With logging off, only its own switching and clearing go in: nothing else is clipped
-        // or redacted for nothing.
-        let wanted = self.log.on() || matches!(id, "project.logCommands" | "project.clearLog");
-        // Undo and redo go in when they take a step back or bring one back: pressed with nothing
-        // to undo, they change nothing, and each press would be an entry.
-        let stepped = !matches!(id, "edit.undo" | "edit.redo") || res.is_ok();
-        if !pending && wanted && stepped {
-            // Outside `guarded`'s catch: logging is best-effort, so a panic in it leaves the
-            // command's result as it was, without an entry, and says so in the app's log.
-            let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if project_log::is_logged(self, id, params) {
-                    let params = match step {
-                        Some(label) => serde_json::json!({"step": label}),
-                        None => project_log::kept_params(params),
-                    };
-                    let e = project_log::entry(id, params, &res, at, start.elapsed());
-                    if joins && res.is_ok() { self.log.join_last(e) } else { self.log.push(e) }
-                }
-            }));
-            if logged.is_err() {
-                log::warn!("the session log has no entry for {id}: writing it failed unexpectedly");
+        let _diagnostic_scope = self.diagnostics.enter();
+        let source = self.registry.get(id).map(|spec| spec.id).or_else(|| id.starts_with(rustgis_plugins::PREFIX).then_some("Plugin"));
+        // Restored on every path, including panics outside `guarded`, so a later notice is not
+        // attributed to an aborted command. Mirrors the capture scope's restore-on-drop.
+        let previous = std::mem::replace(&mut self.diagnostic_source, source);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let notice_mark = self.notice_mark();
+            if self.depth > 0 {
+                return self.run_command(id, params);
             }
+            // Undo and redo are logged with the step they take back or bring back.
+            let step = match id {
+                "edit.undo" => self.undo_label(),
+                "edit.redo" => self.redo_label(),
+                _ => None,
+            };
+            // A step that joins the last one (a held arrow key nudging an element: `merge_undo`) is
+            // one entry too, as it is one step to undo.
+            let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
+            let (at, start) = (project_log::now_ms(), web_time::Instant::now());
+            let res = self.run_command(id, params);
+            // A plugin's command waiting for its fetches answers `pending` and runs again when they
+            // land: logged then, once. (Another command's `pending`, a download the web app makes, is
+            // logged as it is asked for: nothing runs it again.)
+            let pending = id.starts_with(rustgis_plugins::PREFIX)
+                && res.as_ref().is_ok_and(|v| v.get("pending").and_then(Value::as_bool) == Some(true));
+            // With logging off, only its own switching and clearing go in: nothing else is clipped
+            // or redacted for nothing.
+            let wanted = self.log.on() || matches!(id, "project.logCommands" | "project.clearLog");
+            // Undo and redo go in when they take a step back or bring one back: pressed with nothing
+            // to undo, they change nothing, and each press would be an entry.
+            let stepped = !matches!(id, "edit.undo" | "edit.redo") || res.is_ok();
+            if !pending && wanted && stepped {
+                // Outside `guarded`'s catch: logging is best-effort, so a panic in it leaves the
+                // command's result as it was, without an entry, and says so in the app's log.
+                let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if project_log::is_logged(self, id, params) {
+                        let params = match step {
+                            Some(label) => serde_json::json!({"step": label}),
+                            None => project_log::kept_params(params),
+                        };
+                        let e = project_log::entry(id, params, &res, at, start.elapsed());
+                        if joins && res.is_ok() { self.log.join_last(e) } else { self.log.push(e) }
+                    }
+                }));
+                if logged.is_err() {
+                    log::warn!("the session log has no entry for {id}: writing it failed unexpectedly");
+                }
+            }
+            // A refused command is said once, without secrets, as the front ends show it.
+            if let Err(error) = &res {
+                let text = Session::redacted(error);
+                if !self.notices_since(notice_mark).iter().any(|notice| notice.error && notice.text == text.as_str()) {
+                    self.notify_redacted(text, true);
+                }
+            }
+            res
+        }));
+        self.diagnostic_source = previous;
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
-        res
     }
 
     fn run_command(&mut self, id: &str, params: &Value) -> CmdResult {
@@ -1100,7 +1214,7 @@ impl Session {
                     said.push(format!("{} more", unknown.len() - 5));
                 }
                 let reads = if known.is_empty() { "no parameters".to_string() } else { known.join(", ") };
-                self.notify(format!("{id} ignores {} (it reads {reads})", said.join(", ")), false);
+                self.warn(format!("{id} ignores {} (it reads {reads})", said.join(", ")));
             }
         }
         // Layer conditions apply to the layer the parameters name (the first of a list), falling
@@ -1128,7 +1242,22 @@ impl Session {
             return Err(e);
         }
         self.merge = merge;
-        let res = self.guarded(label, mutates, |s| run(s, params));
+        // A layer added from a saved web-service connection records it, inside the command's step.
+        let res = self.guarded(label, mutates, |s| {
+            let add = |s: &mut Session| {
+                let before = service_logins::before(s, id, params)?;
+                let out = run(s, params)?;
+                if let Some(before) = before {
+                    service_logins::tag(s, params, before, &out)?;
+                }
+                Ok(out)
+            };
+            if matches!(id, "layer.addUrl" | "layer.addDownload") && params.get("anonymous").and_then(Value::as_bool) == Some(true) {
+                service_logins::anonymously(s, true, add).unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")))
+            } else {
+                add(s)
+            }
+        });
         if id == "layer.addDownload"
             && res.is_ok()
             && let Some(token) = params.get("geolibreLayer").and_then(|v| v.get("token")).and_then(serde_json::Value::as_str)
@@ -1141,7 +1270,8 @@ impl Session {
         {
             self.sources.note(src);
         }
-        res
+        // An error never quotes a web-service connection's password or key.
+        res.map_err(|e| render::rustgis_tiles::logins::scrub(&e))
     }
 
     /// Retires only this consumed reservation, preserving unrelated pending imports in history.
@@ -1293,7 +1423,7 @@ impl Session {
                     .skip(history_from)
                     .filter(|record| !record.ok && rustgis_analysis::tool(&record.id).is_some_and(cmd::gp::writes_files))
                 {
-                    self.project.gp_history.push(record);
+                    self.project.gp_history.push(record.scrubbed());
                     recorded_failure = true;
                 }
                 if recorded_failure {
@@ -1377,12 +1507,15 @@ impl Session {
             plugin_runs: take(&mut self.plugin_runs),
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
+            landed_reads: take(&mut self.landed_reads),
             url_requests: take(&mut self.url_requests),
             plugin_retries: take(&mut self.plugin_retries),
             style_view: self.style_view.take(),
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: take(&mut self.sql_results),
             trend_results: take(&mut self.trend_results),
+            raster_results: take(&mut self.raster_results),
+            raster_runs: take(&mut self.raster_runs),
             edit_counts: take(&mut self.edit_counts),
         }
     }
@@ -1425,12 +1558,15 @@ impl Session {
             plugin_runs,
             downloading,
             downloaded,
+            landed_reads,
             url_requests,
             plugin_retries,
             style_view,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results,
             trend_results,
+            raster_results,
+            raster_runs,
             edit_counts,
         } = *a;
         (self.undo, self.redo, self.back, self.forward, self.last_camera) = (undo, redo, back, forward, last_camera);
@@ -1447,7 +1583,8 @@ impl Session {
         (self.pending, self.plugin_runs, self.plugin_retries) = (pending, plugin_runs, plugin_retries);
         self.file_outputs = file_outputs;
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
-        self.trend_results = trend_results;
+        self.landed_reads = landed_reads;
+        (self.trend_results, self.raster_results, self.raster_runs) = (trend_results, raster_results, raster_runs);
         #[cfg(feature = "geolibre")]
         {
             self.started = started;
@@ -1459,7 +1596,43 @@ impl Session {
     }
 
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
-        self.notices.push(Notice { text: text.into(), error });
+        use rustgis_data::diagnostics::Severity;
+        self.notice(text.into(), if error { Severity::Error } else { Severity::Info });
+    }
+
+    /// A nonfatal problem: existing notice consumers still see it as a non-error, while
+    /// troubleshooting history can distinguish it from ordinary informational notices.
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.notice(text.into(), rustgis_data::diagnostics::Severity::Warning);
+    }
+
+    fn notice(&mut self, text: String, severity: rustgis_data::diagnostics::Severity) {
+        // A web-service connection's password or key never shows, whatever quoted it: scrubbed
+        // first, as its login values are known only here, then redacted for the status bar and
+        // the history alike. `redact` bounds the notice to 8 KiB (an ellipsis marks the cut) and
+        // omits one over 16 KiB whole, so a clipped credential can't survive; the history's copy
+        // is bounded further, to a record's 2 KiB.
+        self.notice_redacted(Self::redacted(&text), severity);
+    }
+
+    /// `text` scrubbed of every active web-service login (and any login capability), then
+    /// redacted: what a notice or history record may show. Login values are known only here, so
+    /// a failure redacted by [`Session::notify_redacted`]'s callers goes through this first.
+    pub fn redacted(text: &str) -> rustgis_data::diagnostics::Redacted {
+        rustgis_data::diagnostics::Redacted::new(&render::rustgis_tiles::logins::scrub(text))
+    }
+
+    /// [`Session::notify`] for text already scrubbed and redacted by [`Session::redacted`] (a
+    /// failure the caller redacted to compare it with the notices): the type says so, so it isn't
+    /// redacted again.
+    pub fn notify_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, error: bool) {
+        use rustgis_data::diagnostics::Severity;
+        self.notice_redacted(text, if error { Severity::Error } else { Severity::Info });
+    }
+
+    fn notice_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, severity: rustgis_data::diagnostics::Severity) {
+        self.diagnostics.push_redacted(severity, self.diagnostic_source.unwrap_or("Application"), &text);
+        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error });
         self.notices_given += 1;
         if self.notices.len() > 200 {
             self.notices.remove(0);

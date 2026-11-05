@@ -36,7 +36,10 @@ The desktop app keeps installed packages in `plugins/` in its data folder (overr
 `$RUSTGIS_PLUGINS_DIR`) and loads them at startup. The web app remembers the
 plugins you installed from the registry and downloads them again on your next visit. Packages
 installed from files are remembered when they are at most 1.5 MiB; larger ones last for the
-current session only.
+current session only. When one of them can't be loaded on a visit (you're offline, the download
+is gone or has changed), the web app says so once and lists it on the **Installed** tab as *Not
+loaded*, with why. **Retry** downloads a plugin from the registry again; **Remove** forgets it, so
+the web app stops trying at start. A plugin that fails to load is never forgotten on its own.
 
 On the command line:
 
@@ -444,6 +447,11 @@ GeoTIFF or a FlatGeobuf or GeoParquet whose header was fetched already is added 
 downloads wait at a time: a request past 16 fails, and if the command then fails too, none of its
 downloads start. Run by
 `rustgis-cli`, a script or a task, the command waits and answers what was added.
+
+Other commands that wait for a server (`service.add`, say) still wait with the window held. A
+command the user starts from the ribbon, command search or a panel first shows "Running …" in the
+status bar with a busy cursor, and clicks made during a long run are dropped, so they don't run it
+again.
 
 `rustgis-cli commands` lists every command id and its parameters.
 

@@ -15,7 +15,7 @@ Formats](data-formats.md).
 | FlatGeobuf (`.fgb`) | Yes | Yes (`share.exportLayer`) |
 | KML/KMZ (with their styles), GPX | Yes | Yes |
 | Spreadsheets (`.xlsx`, `.xls`, `.ods`), GeoRSS feeds, LandXML, encoded polylines | Yes | No |
-| GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, AutoCAD DXF (ASCII) | Yes | No |
+| GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, CityJSON (footprints with heights), AutoCAD DXF (ASCII) | Yes | No |
 | LiDAR point clouds: LAS, LAZ, COPC (an evenly spread sample) | Yes | No |
 | Geotagged photos (JPEG with EXIF GPS): points with their thumbnails | Yes | No |
 | Esri File Geodatabase (`.gdb` folder; 3D multipatches as footprints) | Yes (desktop) | No |
@@ -74,8 +74,9 @@ and S-JTSK, the same built-in Helmert datum transformation as the EPSG definitio
 transformation in the file takes precedence. RDN2008 and IGM95 are treated as WGS 84-like
 datums. These transformations do not replace regional grid corrections for survey accuracy. An
 unrecognized datum keeps its ellipsoid and produces a notice when no transformation is
-available. Swiss oblique Mercator and the standard Krovak East/North variant are supported from
-their parameters.
+available. Swiss oblique Mercator, the standard Krovak East/North variant, and the oblique
+Mercator, Cassini-Soldner, polyconic and Equal Earth methods are supported from their
+parameters.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.
@@ -584,6 +585,45 @@ database is kept without its password. The commands `sources.list`, `sources.sav
 `sources.favourite` and `sources.remove` read and change the lists, for the command line and the
 [AI Assistant](assistant.md). On the command line they last for the run.
 
+### HTTPS certificates
+
+On desktop and the command line, RustGIS's HTTPS clients use platform certificate verification:
+OGC services (WMS, WMTS, WFS and WCS), web tiles and downloads, ArcGIS portal sign-in's token
+requests, the AI Assistant's model requests, the plugin registry, the uv download that makes
+Python environments, and the GeoLibre runner installer. A private or enterprise CA (or a TLS
+inspection proxy's) must be trusted by the operating system for the account running RustGIS:
+
+- **Windows:** install the CA in the appropriate Windows Trusted Root Certification
+  Authorities store. Windows evaluates the certificate chain and its trust/distrust policies.
+- **macOS:** install and trust the CA for SSL in Keychain Access.
+- **Linux and the BSDs:** install the CA in the system CA bundle, or set `SSL_CERT_FILE` to a PEM
+  CA bundle and/or `SSL_CERT_DIR` to CA certificate directories before starting RustGIS. These
+  variables select the trust sources instead of the default system locations (an empty
+  `SSL_CERT_DIR` counts as unset).
+  If no default system roots are found and neither variable is set, this client falls back to
+  its bundled Mozilla roots, so public HTTPS still works in minimal containers. It does not
+  add Mozilla roots to an existing CA store (even one it can't read) or an explicitly configured one.
+
+`SSL_CERT_FILE` and `SSL_CERT_DIR` do **not** override Windows or macOS trust for this client.
+Restart RustGIS after changing certificate trust. The service must still send a valid chain,
+use a certificate matching its hostname, and have unexpired certificates; there is no option
+to skip verification. Database connections (PostgreSQL/PostGIS, MySQL, SQL Server) have their
+own TLS settings; PostGIS with verification on and no root certificate given still trusts only
+the bundled roots.
+
+Two steps use other trust:
+
+- **ArcGIS sign-in** opens the portal's page in your browser, which checks the portal's
+  certificate with its own trust (some browsers keep their own certificate store). If it doesn't
+  trust the CA, sign-in stops before RustGIS gets a token.
+- **uv**, making a plugin's Python environment, downloads Python and packages with its bundled
+  Mozilla roots. To have it use the operating system's trust, set `UV_SYSTEM_CERTS=true` in the
+  environment (or `system-certs = true` in a `uv.toml`) before starting RustGIS. A non-empty
+  `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces uv's roots on every platform.
+
+The web app continues to use the browser's certificate verification and fetch behavior; its
+server must also allow browser requests (CORS).
+
 ### Named connections
 
 In the pane, **New Connection ▾** and **Edit…** let you set the name, group and address;
@@ -736,8 +776,8 @@ session registry used by the S3 dialog and `s3.connect`, so editing or removing 
 connection also affects a session entry of the same name created there.
 Renaming clears runtime entries under both the old and new names, so the renamed
 connection cannot inherit an unrelated login at its destination name.
-Web-service logins are not supported. Plugins may list connections but cannot manage, log in
-to, forget passwords or S3 keys for, choose an S3 connection for, test or browse them. The in-app
+Plugins may list connections but cannot manage, log in to, log out of, forget passwords, logins
+or S3 keys for, choose an S3 connection for, test or browse them. The in-app
 assistant asks for fresh approval each time for those operations, including Forget, S3 source
 selection and scripted calls; external assistants using MCP cannot run them. Even `probe: true`
 needs approval: connection operations cannot be approved for the whole conversation.
@@ -750,6 +790,59 @@ S3 dialog; use the imported named connections instead. Testing S3 can register o
 session endpoint and credentials under the form's connection name, including a same-name
 session created in the S3 dialog. Cancel does not disconnect that login or restore the
 previous one. CLI and Python connections last only for the run.
+
+#### Web-service logins
+
+A WMS, WMTS, WFS, WCS, OGC API, ArcGIS REST, CSW or STAC connection can log in: its form's
+**Login** picks **None**, **Basic authentication** (a user name and a password) or **API key in a
+header** (the header's name, such as `X-API-Key`, and the key). The connection keeps only the method,
+the user name and the header name, never the password or key.
+The password or key goes to `connection.login {"id":"c1","password":"…"}` (basic) or
+`{"id":"c1","apiKey":"…"}` and lasts only for this session. Web-service logins never access the
+computer's credential store. Editing the origin, method, user or header name ends the login (a
+connection's kind doesn't change: make a new one); renaming the connection or changing its path
+at the same origin does not. **Log Out**
+(`connection.logout`) removes the session login. Log in again when a new session needs it.
+
+A login is sent only to the connection's origin: the same scheme, host and port, for its
+capabilities, listings, tiles, feature pages and refreshes. On the desktop a redirect within that
+origin keeps the login, and a redirect to another origin is followed without it, never getting
+another connection's login either. In the web app a request carrying a login isn't redirected at
+all, since the browser can't take the login off on the way: a service that redirects (to
+`https://` or to another path) fails there, so save the connection with the address it ends at.
+If a service supplies a same-origin link too long to carry its login, the request is refused
+instead of being fetched anonymously. Addresses that cannot be rebound to a login are left
+unchanged and reported.
+A plain `http://` address sends the login unencrypted, so the form asks for confirmation
+and the command needs `"allowInsecure": true`. Error messages, notices, the preferences,
+projects, History and what the [AI Assistant](assistant.md) sees never hold the password or key.
+Runtime login bindings are also removed from recorded command parameters, including addresses
+embedded in text, when saving, recovering or exporting them. The live session keeps its originals.
+
+A project's layers use the connection they record; layers recording none use an explicit session
+choice or the only saved connection for their origin. Different connections and sessions can use
+different logins at the same origin without sharing credentials or authenticated cached responses.
+When several saved connections match the address, RustGIS asks which one to use (**Choose
+Connection…**, `connection.login {id}` for the one chosen) and never picks one itself.
+When an origin has exactly one saved connection and it has a login method, an address at that
+origin is read through that connection, so it needs that login: log in, or save a public
+connection for the address too.
+A layer that has no login yet asks for one, and a layer whose recorded connection isn't on this computer offers
+to make one for its address. `connection.list` reports these as `loginRequests` with the `origin`.
+Logging in retries waiting remote rasters without changing their style. A dated layer also asks
+for the login covering dates at its recorded connection's origin, even when it reopens on a date
+hosted elsewhere. Those foreign-origin dates stay anonymous.
+CLI and Python use the same session-only `connection.login` commands. ArcGIS sign-in and tokens
+keep their own [ArcGIS sign-in](#web-data). A login ends with the session that made it.
+Unbound fetches never adopt another session's service login.
+Layers added by plugins stay anonymous, including after saving and reopening a project or adding
+a saved connection later. To use a connection's login, add the layer yourself through that connection.
+A plugin cannot set a same-origin legend on a layer tied to a saved connection, even when that
+connection is currently public. If it changes the legends of an unconnected tile layer, that
+layer stays anonymous too.
+Refreshing a plugin-added service group also stays anonymous: its capabilities, linked documents,
+feature downloads and newly discovered collections do not borrow a saved login. The group keeps
+that provenance after saving and reopening, even if a refresh temporarily leaves it empty.
 
 ## Large files
 
@@ -806,7 +899,7 @@ index. Deleting idle cache files does not modify the dataset.
 On the desktop, a GeoJSON FeatureCollection larger than 32 MB is read the same way, with no size
 limit: opening reads the file once, keeping each feature's place in it and its bounding box (a
 file over 256 MB through a buffer, so it is never held whole), and each view parses just the
-features it shows. A single feature, a bare geometry or TopoJSON is loaded whole.
+features it shows. A single feature, a bare geometry, TopoJSON or CityJSON is loaded whole.
 
 A streamed layer works like any other for symbology, labels, pop-ups, selection and the
 attribute table (which lists the features read for the view). On the desktop, **Export Features**
@@ -912,8 +1005,9 @@ as RGB; other YCbCr and CMYK images aren't read. A rotated or skewed image is re
 north-up grid as it is read. The coordinate system is an EPSG code,
 or the file's own projection described in its GeoKeys (Albers, Lambert conformal conic, transverse
 Mercator, Mercator, Lambert azimuthal, stereographic, equirectangular, sinusoidal and others), which an
-exported GeoTIFF keeps. A raster too large to hold in memory (more than 120 million samples, 32
-million in the web app) opens from its largest overview that fits; one without overviews opens as
+exported GeoTIFF keeps. A raster too large to hold in memory (more than 120 million samples, or
+more on a computer with more memory, see Environments in the analysis guide; 32 million in the
+web app) opens from its largest overview that fits; one without overviews opens as
 an overview made as it is read, a strip or tile at a time (every second, fourth… pixel each way),
 so reading it takes as long as decoding the whole file once. A cloud-optimised GeoTIFF added by its
 web address is read in place instead, a tile at a time (see [Files on the
@@ -1074,6 +1168,10 @@ whose bytes exactly match one of those snapshots restores its secrets; saving mo
 snapshots evicts the oldest. Changed files, packages, imports and files saved by another process
 never restore secrets. After a snapshot is evicted or RustGIS closes, add those layers again with
 their credentials.
+A layer added from a saved web-service connection records the connection's id (`"connection"`
+in the `.rgis` file; never its login), so the project needs no token in its addresses. See
+[Web-service logins](#web-service-logins) for what happens when it opens where that connection or
+its login is missing.
 
 ### Complete streamed Shapefile rendering
 

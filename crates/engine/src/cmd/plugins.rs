@@ -283,6 +283,7 @@ const NEVER: &[&str] = &[
     "connection.login",
     "connection.forgetPassword",
     "connection.forgetSavedKeys",
+    "connection.logout",
     "connection.resolveS3",
     "connection.test",
     "connection.browse",
@@ -350,7 +351,9 @@ pub fn user_only(id: &str) -> bool {
 }
 
 /// What running `spec` with `params` reaches beyond the project, if anything: by what the
-/// parameters name, what the command's parameters can name, and what it is.
+/// parameters name, what the command's parameters can name, and what it is. Without the session,
+/// it counts every `raster.mosaic` as reaching files; `refused` lets a plugin's mosaic of the
+/// project's layers through.
 pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     // External tools (the GeoLibre suite) run a native program that reads files a parameter
     // names, including bare file names.
@@ -380,10 +383,14 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if DATABASES.contains(&spec.id) {
         return Some(Reach::Files);
     }
-    // Georeferencing and projecting write a file only when given a `path`; the rest of them stays
-    // in the project.
-    if spec.id == "raster.georeference" || spec.id == "raster.project" {
-        return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
+    // Georeferencing, projecting and rasterizing write a file only when given a `path` (they read
+    // a null one as none); the rest of them stays in the project.
+    if ["raster.georeference", "raster.project", "raster.rasterize"].contains(&spec.id) {
+        let mut given = params.clone();
+        if let Some(o) = given.as_object_mut() {
+            o.retain(|_, v| !v.is_null());
+        }
+        return super::items::names_place(&given, PLACE_KEYS, 0).then_some(Reach::Files);
     }
     // A built-in tool's output layer name stays in the session, as it does in a task.
     let params = super::items::layer_name_left_out(spec.id, params);
@@ -395,18 +402,29 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     files.then_some(Reach::Files)
 }
 
-/// Why a plugin may not run `id` with `params`, if it may not.
-fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
+/// Why a plugin may not run `id` with `params` on the session `s`, if it may not.
+fn refused(s: &Session, plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
     let m = &plugin.manifest;
     if user_only(spec.id) {
         return Some(format!("plugins can't run '{}'", spec.id));
+    }
+    // A saved web-service connection's login goes where the user chose it: a plugin never picks
+    // which login a request carries, as it never logs in or out.
+    if let Some(id) = params.get("connection").and_then(Value::as_str).map(str::trim)
+        && s.connections.connections.iter().any(|c| c.id == id && crate::service_logins::is_service(c))
+    {
+        return Some(format!("plugins can't use a saved web-service connection's login ('{}')", spec.id));
     }
     // An SQL query reads files and web addresses alike, and a database is a file or a server.
     let database = DATABASES.contains(&spec.id) || (spec.id == "cube.open" && super::cube_catalog::opens_zarr(params));
     if database && !(m.has(Permission::Files) && m.has(Permission::Network)) {
         return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
     }
-    match reaches(spec, params) {
+    // A mosaic writes a file only when given a `path`, and reads one for an input that is a raster
+    // file name and isn't a raster layer with its cells in memory; a mosaic of the project's layers
+    // stays in it, as `raster.project` does.
+    let reach = reaches(spec, params).filter(|_| !(spec.id == "raster.mosaic" && super::imagery::mosaic_stays_in_project(s, params)));
+    match reach {
         Some(Reach::Files)
             if spec.id == "gp.run"
                 && !m.has(Permission::Files)
@@ -517,7 +535,7 @@ impl Bridge<'_> {
             return Err("plugins can't run other plugins' commands".into());
         }
         let spec = self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
-        if let Some(why) = refused(&self.plugin, spec, params) {
+        if let Some(why) = refused(self.s, &self.plugin, spec, params) {
             return Err(why);
         }
         let (enabled, run, label, mutates) = (spec.enabled, spec.run, spec.label, spec.mutates);
@@ -544,8 +562,21 @@ impl Bridge<'_> {
         // command that only left a request for the front end ([`Session::request_url`]) changed
         // nothing; a later one must not erase the undo step for an earlier edit.
         self.s.request_only = false;
-        let mut res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self.s, params)))
-            .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
+        // No saved web-service login goes with what a plugin asks for: the user chooses where it is sent.
+        let anonymous = self.s.web_logins.set_anonymous(true);
+        let mut res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let before = if mutates { crate::service_logins::before(self.s, id, params)? } else { None };
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self.s, params)))
+                .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
+            // Mark additions even when a command reports an error after changing the project.
+            // Their addresses must remain anonymous at later logins and after saving/reopening.
+            if let Some(before) = before {
+                crate::service_logins::tag(self.s, params, before, out.as_ref().unwrap_or(&Value::Null))?;
+            }
+            out
+        }))
+        .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
+        self.s.web_logins.set_anonymous(anonymous);
         let requested = std::mem::take(&mut self.s.request_only);
         self.requested |= requested;
         self.changed |= mutates && !requested;

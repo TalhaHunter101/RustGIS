@@ -200,6 +200,12 @@ fn plan(r: &Raster, band: usize) -> Result<Plan> {
     })
 }
 
+/// The bands [`write`] keeps of `r` with `band` asked for, 0-based: the colour bands, grey and
+/// alpha, or `band` alone; an error when it can't write `r`.
+pub fn bands_written(r: &Raster, band: usize) -> Result<Vec<usize>> {
+    plan(r, band).map(|p| p.bands)
+}
+
 /// One image of the file: the full one (factor 1) or an overview.
 struct Level {
     w: u32,
@@ -414,6 +420,11 @@ fn entries(r: &Raster, plan: &Plan, lv: &Level, first: bool, geo: &GeoKeys, big:
                 plan.bands.iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < n)).then(|| "nan".to_string())
             }
         };
+        // The written bands' names and the first one's class names, so a reopened window keeps
+        // them (a band keeping its number has no name to write).
+        if let Some(xml) = super::gdal_metadata_of(r, &plan.bands) {
+            e.push(ascii(42112, &xml));
+        }
         if let Some(nd) = nodata {
             e.push(ascii(42113, &nd));
         }
@@ -547,9 +558,11 @@ pub fn write_to<W: Write + Seek>(r: &Raster, band: usize, flavour: Flavour, out:
 
     // Smallest overview first, the full image last; each in row order.
     let mut places: Vec<Vec<(u64, u64)>> = vec![Vec::new(); levels.len()];
+    crate::progress::begin(tiles);
     for (i, lv) in levels.iter().enumerate().rev() {
         for ty in 0..lv.down {
             for tx in 0..lv.across {
+                crate::progress::step(1)?;
                 let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&tile_samples(r, &plan, lv, tx, ty), DEFLATE_LEVEL);
                 if !big && pos + zipped.len() as u64 > u64::from(u32::MAX) {
                     return Err(err("the file is too large for classic TIFF"));
@@ -604,6 +617,9 @@ pub fn write_file(r: &Raster, band: usize, path: &Path) -> Result<CogInfo> {
         let f = w.into_inner().map_err(|e| err(e.error()))?;
         f.sync_all()?;
         drop(f);
+        // A cancel that came while it was written leaves the file there before as it was. This is
+        // the last look: the rename commits the file, and a Cancel after it finds it written.
+        crate::progress::check()?;
         std::fs::rename(&tmp, path)?;
         Ok(info)
     })();
@@ -990,5 +1006,26 @@ mod tests {
         // Grey with alpha: the COG keeps both bands, the GeoTIFF the chosen one.
         let (alpha, _) = &cases[1];
         assert_eq!((geotiff::written_bands(alpha, 0), written_bands(alpha, 0).unwrap()), (vec![0], vec![0, 1]));
+    }
+
+    /// A cancelled GeoTIFF or COG write stops with [`DataError::Cancelled`], the COG leaving no
+    /// file; without a probe both are written.
+    #[test]
+    fn a_cancelled_raster_write_stops() {
+        use crate::progress::{install, tests::Counted};
+        let (w, h) = (1100u32, 1100u32);
+        let r = utm(w, h, vec![(0..w * h).map(|i| (i % 997) as f32).collect()], ColorHint::Gray, "Float32", None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.tif");
+        {
+            let _g = install(Some(Counted::cancelling_after(2)));
+            assert!(matches!(write_file(&r, 0, &path), Err(DataError::Cancelled)));
+            // Cancelled before it starts: the GeoTIFF writer counts nothing.
+            let _g = install(Some(Counted::cancelling_after(0)));
+            assert!(matches!(geotiff::write(&r, 0), Err(DataError::Cancelled)));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        write_file(&r, 0, &path).unwrap();
+        assert!(geotiff::write(&r, 0).is_ok());
     }
 }

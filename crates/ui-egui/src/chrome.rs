@@ -339,6 +339,12 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                         let _ = app.run("select.clear", Value::Null);
                     }
                 }
+                // An export writing its file: its progress and Cancel.
+                #[cfg(not(target_arch = "wasm32"))]
+                if app.export_job.is_some() {
+                    sep(ui, &t);
+                    crate::exportjob::status(app, ui, &t);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // The CPU/GPU backend toggle, then the frame rate (live while the map moves,
                     // "— fps" when idle), then the last render's cost.
@@ -416,14 +422,23 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                             sep(ui, &t);
                         }
                     }
-                    // Cut to the room left (the whole notice on hover), so a long one doesn't run
-                    // over the selection count and coordinates.
-                    if let Some(n) = app.session.notices.last() {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&n.text).size(11.5).color(if n.error { t.red } else { t.text_dim }))
+                    if ui.small_button(tl!("Diagnostics")).on_hover_text(tl!("Review messages and failed network requests")).clicked() {
+                        app.ui.open_right(crate::RightPane::DiagnosticLog);
+                    }
+                    // Cut to the room left (the whole notice on hover), so it doesn't run
+                    // over the selection count and coordinates. A click opens its history.
+                    if let Some(running) = crate::pluginstart::running(app) {
+                        ui.add(egui::Label::new(egui::RichText::new(running).size(11.5).color(t.accent)).truncate());
+                    } else if let Some(n) = app.session.notices.last()
+                        && ui.add(
+                            egui::Button::new(egui::RichText::new(&n.text).size(11.5).color(if n.error { t.red } else { t.text_dim }))
+                                .frame(false)
+                                .small()
                                 .truncate(),
                         )
-                        .on_hover_text(&n.text);
+                        .on_hover_text(crate::i18n::fmt("{message}\n{open}", &[("message", &n.text), ("open", tl_raw!("Open Diagnostics"))]))
+                        .clicked() {
+                        app.ui.open_right(crate::RightPane::DiagnosticLog);
                     }
                 });
             });
@@ -630,6 +645,11 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
         if id == "edit.paste" && !p.get("text").and_then(Value::as_str).is_some_and(|t| t.trim_start().starts_with('{')) {
             continue;
         }
+        // Exhausted undo/redo shortcuts are inert, like their disabled toolbar buttons.
+        // Do not dispatch them: a failed command is retained by Diagnostics.
+        if (id == "edit.undo" && !app.session.can_undo()) || (id == "edit.redo" && !app.session.can_redo()) {
+            continue;
+        }
         // A command that can't run now says why, as its greyed ribbon button does (#456).
         // Running out of undo or redo needs no word.
         if !matches!(id, "edit.undo" | "edit.redo")
@@ -649,7 +669,7 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
 
 /// Whether a UI command is available on the current platform.
 pub(crate) fn command_available(id: &str, web: bool) -> bool {
-    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay")
+    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay" | "ui.themeLoad" | "ui.themeReload")
 }
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
@@ -674,15 +694,21 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.pane.geoprocessing", "Tools Pane", "View › Windows"),
     ("ui.pane.symbology", "Symbology Pane", "Style › Drawing"),
     ("ui.pane.labeling", "Labeling Pane", "View › Windows"),
+    ("ui.pane.diagnosticLog", "Diagnostics", "View › Windows"),
     ("ui.pane.assistant", "AI Assistant", "Analyze › AI"),
     ("ui.pane.sql", "SQL Pane", "Analyze › Workflows"),
     ("ui.pane.directions", "Directions", "Home › Navigate"),
     ("ui.pane.bookmarks", "Bookmarks Pane", "Home › Navigate › Bookmarks"),
-    ("ui.theme", "Toggle Dark Mode", "View"),
+    ("ui.theme", "Toggle Dark Mode", "Settings › Theme"),
+    ("ui.themeFile", "Follow the System", "Settings › Theme"),
+    ("ui.themeLoad", "Load a Theme from File…", "Settings › Theme"),
+    ("ui.themeReload", "Reload Themes", "Settings › Theme"),
+    ("ui.scale", "Reset Interface Scale", "Settings › Theme"),
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
     ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
     ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),
     ("ui.moveSharedVertices", "Shared Vertices", "Edit › Features"),
+    ("ui.traceEdges", "Trace", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
 ];
@@ -973,8 +999,8 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for &(id, label, loc) in UI_COMMANDS {
-            // The web app always serves the latest release (no Check for Updates button) and is
-            // one process a loopback relay could not reach (`ui.mcpRelay` is desktop only).
+            // Match the platform availability used by the shortcut editor, including desktop
+            // theme files and the loopback relay.
             if !command_available(id, cfg!(target_arch = "wasm32")) {
                 continue;
             }

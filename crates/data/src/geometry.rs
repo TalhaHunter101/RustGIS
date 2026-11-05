@@ -242,7 +242,7 @@ impl Geometry {
                 let steps = LABEL_GRID_STEPS;
                 let mut best: Option<(f64, Coord)> = None;
                 for i in 1..steps {
-                    let y = e.min_y + e.height() * i as f64 / steps as f64;
+                    let y = grid_coord(e.min_y, e.max_y, i);
                     // Evaluate the same 65 grid points together. Each crossing toggles a
                     // prefix of x samples, replacing 65 repeated edge walks per scanline.
                     let mut inside = rings.first().map_or(0, |ring| label_grid_ring(ring, y, &e));
@@ -251,7 +251,7 @@ impl Geometry {
                     }
                     let mut run_start: Option<f64> = None;
                     for j in 0..=steps {
-                        let x = e.min_x + e.width() * j as f64 / steps as f64;
+                        let x = grid_coord(e.min_x, e.max_x, j);
                         match (inside & (1u128 << j) != 0, run_start) {
                             (true, None) => run_start = Some(x),
                             (false, Some(s)) => {
@@ -271,6 +271,18 @@ impl Geometry {
     }
 }
 
+/// The `k`th of the label grid's sample positions between `min` and `max`. A span too wide for
+/// `f64` (beyond `f64::MAX`) is interpolated instead, so the samples stay finite; ordinary spans
+/// keep the original expression and its exact bits.
+fn grid_coord(min: f64, max: f64, k: usize) -> f64 {
+    let span = max - min;
+    if span.is_finite() {
+        return min + span * k as f64 / LABEL_GRID_STEPS as f64;
+    }
+    let t = k as f64 / LABEL_GRID_STEPS as f64;
+    min * (1.0 - t) + max * t
+}
+
 /// Exact even-odd results for the label algorithm's existing 0..=64 x samples.
 /// Search uses the original floating-point expression and strict comparison, preserving boundaries.
 fn label_grid_ring(ring: &[Coord], y: f64, extent: &Extent) -> u128 {
@@ -285,7 +297,7 @@ fn label_grid_ring(ring: &[Coord], y: f64, extent: &Extent) -> u128 {
             let (mut lo, mut hi) = (0usize, LABEL_GRID_STEPS + 1);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                let x = extent.min_x + extent.width() * mid as f64 / LABEL_GRID_STEPS as f64;
+                let x = grid_coord(extent.min_x, extent.max_x, mid);
                 if x < crossing {
                     lo = mid + 1;
                 } else {
@@ -662,15 +674,20 @@ impl RingFrame {
     }
 }
 
-/// Orders two rings by absolute area. Rings whose plain shoelace area overflows are compared by
-/// the logarithm of their area in a [`RingFrame`], so huge rings still rank by size.
+/// Orders two rings by absolute area. When either ring needs a scaled [`RingFrame`] (coordinates
+/// above 1e100), both are compared by the logarithm of their frame area, so huge or far-offset
+/// rings rank by their true size rather than an overflowed or cancelled shoelace sum.
 fn ring_area_order(a: &[Coord], b: &[Coord]) -> std::cmp::Ordering {
-    let (aa, bb) = (ring_area(a).abs(), ring_area(b).abs());
-    if aa.is_finite() && bb.is_finite() {
-        return aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal);
+    let (fa, fb) = (RingFrame::new(a), RingFrame::new(b));
+    let plain = |f: &Option<RingFrame>| f.as_ref().is_none_or(|f| f.sx == 1.0 && f.sy == 1.0);
+    if plain(&fa) && plain(&fb) {
+        // Neither ring is scaled: the frame area is the plain shoelace area, bit for bit.
+        let area = |f: &Option<RingFrame>, r: &[Coord]| f.as_ref().map_or(0.0, |f| f.area(r).abs());
+        return area(&fa, a).partial_cmp(&area(&fb, b)).unwrap_or(std::cmp::Ordering::Equal);
     }
-    let log_area = |r: &[Coord]| RingFrame::new(r).map_or(f64::NEG_INFINITY, |f| f.area(r).abs().ln() - f.sx.ln() - f.sy.ln());
-    log_area(a).partial_cmp(&log_area(b)).unwrap_or(std::cmp::Ordering::Equal)
+    let log_area =
+        |f: &Option<RingFrame>, r: &[Coord]| f.as_ref().map_or(f64::NEG_INFINITY, |f| f.area(r).abs().ln() - f.sx.ln() - f.sy.ln());
+    log_area(&fa, a).partial_cmp(&log_area(&fb, b)).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// Planar centroid of a ring (vertex average when degenerate).
@@ -836,6 +853,28 @@ mod tests {
         // A U shape near 1e200 whose centroid falls in the notch, so the scanline picks the label.
         let u = [(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (2.0, 3.0), (2.0, 1.0), (1.0, 1.0), (1.0, 3.0), (0.0, 3.0), (0.0, 0.0)];
         let ring: Vec<Coord> = u.iter().map(|&(x, y)| Coord::new(x * 1e200, y * 1e200)).collect();
+        assert!(!ring_contains(&ring, ring_centroid(&ring).unwrap()));
+        let c = Geometry::Polygon(vec![vec![ring.clone()]]).label_point().unwrap();
+        assert!(ring_contains(&ring, c), "{c:?}");
+    }
+
+    #[test]
+    fn far_offset_small_part_does_not_outrank_a_larger_one() {
+        // At 1e150 the plain shoelace terms are about 1e300, so its sum is rounding noise.
+        let far = vec![square(1e150, 1e150, 1.0)];
+        let near = vec![square(0.0, 0.0, 1e10)];
+        for parts in [vec![far.clone(), near.clone()], vec![near, far]] {
+            let c = Geometry::Polygon(parts).label_point().unwrap();
+            assert!(c.x < 1e11 && c.y < 1e11, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn label_grid_spanning_beyond_f64_max_stays_inside() {
+        // A U shape spanning -1.5e308..1.5e308 on x: its width overflows f64, and its centroid falls in the notch.
+        let m = 1.5e308;
+        let u = [(-m, 0.0), (m, 0.0), (m, 3.0), (m / 3.0, 3.0), (m / 3.0, 1.0), (-m / 3.0, 1.0), (-m / 3.0, 3.0), (-m, 3.0), (-m, 0.0)];
+        let ring: Vec<Coord> = u.iter().map(|&(x, y)| Coord::new(x, y)).collect();
         assert!(!ring_contains(&ring, ring_centroid(&ring).unwrap()));
         let c = Geometry::Polygon(vec![vec![ring.clone()]]).label_point().unwrap();
         assert!(ring_contains(&ring, c), "{c:?}");

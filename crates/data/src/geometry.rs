@@ -281,7 +281,7 @@ fn label_grid_ring(ring: &[Coord], y: f64, extent: &Extent) -> u128 {
     let Some(mut previous) = ring.last() else { return 0 };
     for point in ring {
         if (point.y > y) != (previous.y > y) {
-            let crossing = (previous.x - point.x) * (y - point.y) / (previous.y - point.y) + point.x;
+            let crossing = crossing_x(*point, *previous, y);
             let (mut lo, mut hi) = (0usize, LABEL_GRID_STEPS + 1);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
@@ -573,15 +573,18 @@ pub fn ring_contains(ring: &[Coord], p: Coord) -> bool {
 }
 
 /// Where the edge `a`–`b` crosses the horizontal line at `y`. When the plain formula overflows
-/// (coordinates near `f64::MAX`), it is recomputed on halved values, fraction first, and the result
-/// doubled back, so huge rings still give a finite crossing.
+/// (coordinates near `f64::MAX`), it is recomputed fraction first, halving only the axis whose
+/// differences overflow, so huge rings still give a finite crossing and subnormal values on the
+/// other axis keep their precision.
 fn crossing_x(a: Coord, b: Coord, y: f64) -> f64 {
     let x = (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x;
     if x.is_finite() {
         return x;
     }
-    let t = (y * 0.5 - a.y * 0.5) / (b.y * 0.5 - a.y * 0.5);
-    ((b.x * 0.5 - a.x * 0.5) * t + a.x * 0.5) * 2.0
+    let (ny, dy) = (y - a.y, b.y - a.y);
+    let t = if ny.is_finite() && dy.is_finite() { ny / dy } else { (y * 0.5 - a.y * 0.5) / (b.y * 0.5 - a.y * 0.5) };
+    let dx = b.x - a.x;
+    if dx.is_finite() { dx * t + a.x } else { ((b.x * 0.5 - a.x * 0.5) * t + a.x * 0.5) * 2.0 }
 }
 
 /// Inside the exterior ring and outside every hole.
@@ -822,6 +825,20 @@ mod tests {
         let ring = vec![Coord::new(1e200, 1e200), Coord::new(0.0, 0.0), Coord::new(0.0, 1e200), Coord::new(1e200, 1e200)];
         assert!(!ring_contains(&ring, Coord::new(2e200, 5e199)));
         assert!(ring_contains(&ring, Coord::new(1e199, 5e199)));
+        // Halving only the overflowing axis keeps a subnormal y fraction exact.
+        let (s, m) = (f64::from_bits(1), f64::MAX);
+        let mixed = vec![Coord::new(m, 4.0 * s), Coord::new(-m, 0.0), Coord::new(m, 0.0)];
+        assert!(!ring_contains(&mixed, Coord::new(-0.75 * m, s)));
+    }
+
+    #[test]
+    fn concave_huge_polygon_labels_inside() {
+        // A U shape near 1e200 whose centroid falls in the notch, so the scanline picks the label.
+        let u = [(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (2.0, 3.0), (2.0, 1.0), (1.0, 1.0), (1.0, 3.0), (0.0, 3.0), (0.0, 0.0)];
+        let ring: Vec<Coord> = u.iter().map(|&(x, y)| Coord::new(x * 1e200, y * 1e200)).collect();
+        assert!(!ring_contains(&ring, ring_centroid(&ring).unwrap()));
+        let c = Geometry::Polygon(vec![vec![ring.clone()]]).label_point().unwrap();
+        assert!(ring_contains(&ring, c), "{c:?}");
     }
 
     #[test]

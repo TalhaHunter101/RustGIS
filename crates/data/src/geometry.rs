@@ -224,11 +224,10 @@ impl Geometry {
                 part.get(part.len() / 2).copied()
             }
             Geometry::Polygon(polys) => {
-                let rings = polys.iter().filter(|p| p.iter().all(|r| r.iter().all(|c| c.is_finite()))).max_by(|a, b| {
-                    let aa = a.first().map(|r| ring_area(r).abs()).unwrap_or(0.0);
-                    let bb = b.first().map(|r| ring_area(r).abs()).unwrap_or(0.0);
-                    aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
-                })?;
+                let rings = polys
+                    .iter()
+                    .filter(|p| p.iter().all(|r| r.iter().all(|c| c.is_finite())))
+                    .max_by(|a, b| ring_area_order(a.first().map_or(&[], Vec::as_slice), b.first().map_or(&[], Vec::as_slice)))?;
                 let outer = rings.first()?;
                 let c = ring_centroid(outer)?;
                 if polygon_contains(rings, c) {
@@ -596,62 +595,103 @@ pub fn ring_area(ring: &[Coord]) -> f64 {
     s / 2.0
 }
 
+/// A frame for ring arithmetic that cannot overflow: an axis whose coordinates exceed 1e100 is
+/// scaled to about 1 and shifted so the first vertex sits at 0, keeping shoelace terms small.
+/// Ordinary axes are left as they are, so their results keep their exact bits.
+struct RingFrame {
+    sx: f64,
+    sy: f64,
+    ox: f64,
+    oy: f64,
+}
+
+impl RingFrame {
+    /// The frame for `ring`, or `None` when it is empty or has a non-finite coordinate.
+    fn new(ring: &[Coord]) -> Option<RingFrame> {
+        let first = ring.first()?;
+        let (mut max_x, mut max_y) = (0.0f64, 0.0f64);
+        for c in ring {
+            if !c.is_finite() {
+                return None;
+            }
+            max_x = max_x.max(c.x.abs());
+            max_y = max_y.max(c.y.abs());
+        }
+        let sx = if max_x > 1e100 { 1.0 / max_x } else { 1.0 };
+        let sy = if max_y > 1e100 { 1.0 / max_y } else { 1.0 };
+        let ox = if sx < 1.0 { first.x * sx } else { 0.0 };
+        let oy = if sy < 1.0 { first.y * sy } else { 0.0 };
+        Some(RingFrame { sx, sy, ox, oy })
+    }
+
+    /// `c` in frame units.
+    fn local(&self, c: &Coord) -> (f64, f64) {
+        (c.x * self.sx - self.ox, c.y * self.sy - self.oy)
+    }
+
+    /// A frame point back in coordinate units.
+    fn world(&self, x: f64, y: f64) -> Coord {
+        Coord::new((x + self.ox) / self.sx, (y + self.oy) / self.sy)
+    }
+
+    /// Signed shoelace area of `ring` in frame units.
+    fn area(&self, ring: &[Coord]) -> f64 {
+        let n = ring.len();
+        let mut a = 0.0f64;
+        for i in 0..n {
+            let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
+            let ((px, py), (qx, qy)) = (self.local(p), self.local(q));
+            a += px * qy - qx * py;
+        }
+        a / 2.0
+    }
+}
+
+/// Orders two rings by absolute area. Rings whose plain shoelace area overflows are compared by
+/// the logarithm of their area in a [`RingFrame`], so huge rings still rank by size.
+fn ring_area_order(a: &[Coord], b: &[Coord]) -> std::cmp::Ordering {
+    let (aa, bb) = (ring_area(a).abs(), ring_area(b).abs());
+    if aa.is_finite() && bb.is_finite() {
+        return aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal);
+    }
+    let log_area = |r: &[Coord]| RingFrame::new(r).map_or(f64::NEG_INFINITY, |f| f.area(r).abs().ln() - f.sx.ln() - f.sy.ln());
+    log_area(a).partial_cmp(&log_area(b)).unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// Planar centroid of a ring (vertex average when degenerate).
 ///
 /// Returns `None` if the ring contains non-finite coordinates, has no vertices, or produces a non-finite centroid.
-/// Large coordinate magnitudes (> 1e100) are scaled down automatically to prevent floating-point overflow.
+/// Axes with coordinates above 1e100 are computed in a scaled frame centred on the first vertex,
+/// so they neither overflow nor lose a small ring to cancellation.
 /// For degenerate rings with zero or near-zero planar area, returns the unweighted average
 /// of vertices, excluding the duplicate closing vertex for closed rings.
 pub fn ring_centroid(ring: &[Coord]) -> Option<Coord> {
-    let mut max_x = 0.0f64;
-    let mut max_y = 0.0f64;
-    for c in ring {
-        if !c.is_finite() {
-            return None;
-        }
-        max_x = max_x.max(c.x.abs());
-        max_y = max_y.max(c.y.abs());
-    }
+    let frame = RingFrame::new(ring)?;
     let n = ring.len();
-    if n == 0 {
-        return None;
-    }
-    if max_x == 0.0 && max_y == 0.0 {
-        return Some(Coord::new(0.0, 0.0));
-    }
-
-    let scale_x = if max_x > 1e100 { 1.0 / max_x } else { 1.0 };
-    let scale_y = if max_y > 1e100 { 1.0 / max_y } else { 1.0 };
     let pts = if n > 1 && ring.first() == ring.last() { ring.get(..n - 1).unwrap_or(ring) } else { ring };
+    let a = frame.area(ring);
 
-    let mut a = 0.0f64;
-    for i in 0..n {
-        let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
-        a += (p.x * scale_x) * (q.y * scale_y) - (q.x * scale_x) * (p.y * scale_y);
-    }
-    a /= 2.0;
-
-    let degenerate_threshold = (1e-12 * scale_x * scale_y).max(f64::MIN_POSITIVE);
-    if a == 0.0 || a.abs() < degenerate_threshold {
+    // The plain 1e-12 threshold, in frame units. It may underflow to 0 for huge rings, which then
+    // count as degenerate only at an exact zero area.
+    if a == 0.0 || a.abs() < 1e-12 * frame.sx * frame.sy {
         let count = pts.len() as f64;
-        if count == 0.0 {
-            return None;
-        }
-        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| (x + c.x * scale_x, y + c.y * scale_y));
-        let c = Coord::new((sx / count) / scale_x, (sy / count) / scale_y);
+        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(x, y), c| {
+            let (lx, ly) = frame.local(c);
+            (x + lx, y + ly)
+        });
+        let c = frame.world(sx / count, sy / count);
         return c.is_finite().then_some(c);
     }
 
     let (mut cx, mut cy) = (0.0, 0.0);
     for i in 0..n {
         let (Some(p), Some(q)) = (ring.get(i), ring.get((i + 1) % n)) else { break };
-        let (px, py) = (p.x * scale_x, p.y * scale_y);
-        let (qx, qy) = (q.x * scale_x, q.y * scale_y);
+        let ((px, py), (qx, qy)) = (frame.local(p), frame.local(q));
         let f = px * qy - qx * py;
         cx += (px + qx) * f;
         cy += (py + qy) * f;
     }
-    let c = Coord::new((cx / (6.0 * a)) / scale_x, (cy / (6.0 * a)) / scale_y);
+    let c = frame.world(cx / (6.0 * a), cy / (6.0 * a));
     c.is_finite().then_some(c)
 }
 
@@ -750,6 +790,30 @@ mod tests {
         let c_above = ring_centroid(&p_above).unwrap();
         assert!((c_below.x - 5e98).abs() / 5e98 < 1e-12);
         assert!((c_above.x - 5e100).abs() / 5e100 < 1e-12);
+    }
+
+    #[test]
+    fn huge_rings_keep_precision_and_area_weighting() {
+        // A ring of size 1e90 sitting near 1e101: the scaled frame is centred on the first vertex,
+        // so the shoelace terms do not cancel to noise.
+        let c = ring_centroid(&square(1e101, 1e101, 1e90)).unwrap();
+        let want = 1e101 + 5e89;
+        assert!((c.x - want).abs() < 1e88 && (c.y - want).abs() < 1e88, "{c:?}");
+        // A tiny but nonzero scaled area is still area-weighted, not a vertex average.
+        let kite = vec![Coord::new(0.0, 0.0), Coord::new(1e-110, 0.0), Coord::new(1e200, 1e200), Coord::new(0.0, 1e-110)];
+        let c = ring_centroid(&kite).unwrap();
+        assert!((c.x / (1e200 / 3.0) - 1.0).abs() < 1e-3 && (c.y / (1e200 / 3.0) - 1.0).abs() < 1e-3, "{c:?}");
+    }
+
+    #[test]
+    fn largest_part_wins_when_its_plain_area_overflows() {
+        let small = vec![square(0.0, 0.0, 10.0)];
+        let huge = vec![square(1e160, 1e160, 1e160)];
+        assert!(!ring_area(&square(1e160, 1e160, 1e160)).is_finite());
+        for parts in [vec![small.clone(), huge.clone()], vec![huge, small]] {
+            let c = Geometry::Polygon(parts).label_point().unwrap();
+            assert!(c.x > 1e160 && c.y > 1e160, "{c:?}");
+        }
     }
 
     #[test]

@@ -226,7 +226,7 @@ impl Geometry {
             Geometry::Polygon(polys) => {
                 let rings = polys
                     .iter()
-                    .filter(|p| !p.is_empty() && p.iter().all(|r| r.iter().all(|c| c.is_finite())))
+                    .filter(|p| p.first().is_some_and(|r| !r.is_empty()) && p.iter().all(|r| r.iter().all(|c| c.is_finite())))
                     .max_by(|a, b| ring_area_order(a.first().map_or(&[], Vec::as_slice), b.first().map_or(&[], Vec::as_slice)))?;
                 let outer = rings.first()?;
                 let c = ring_centroid(outer)?;
@@ -920,7 +920,8 @@ mod tests {
     #[test]
     fn ringless_part_does_not_shadow_a_valid_part() {
         let flat = vec![vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0), Coord::new(0.0, 0.0)]];
-        assert_eq!(Geometry::Polygon(vec![flat, vec![]]).label_point(), Some(Coord::new(5.0, 0.0)));
+        assert_eq!(Geometry::Polygon(vec![flat.clone(), vec![]]).label_point(), Some(Coord::new(5.0, 0.0)));
+        assert_eq!(Geometry::Polygon(vec![flat, vec![vec![]]]).label_point(), Some(Coord::new(5.0, 0.0)));
     }
 
     #[test]
